@@ -8,22 +8,23 @@
 //!     數字字面值與 key 順序在 parse → serialize 之間不變
 //!     （沒有這兩個 feature，1.50 會變 1.5、key 會被重排 —— cache 炸）。
 
+pub mod cache_stabilization;
+pub mod ccr;
+pub mod pipeline;
+
 pub mod live_zone {
     //! live-zone 壓縮引擎（與 Python 版行為 / 標記格式逐字對齊）。
 
     use std::borrow::Cow;
 
     use serde_json::Value;
-    use sha2::{Digest, Sha256};
+
+    // content_key 的唯一真相來源在 ccr —— 標記與 store 永遠對得上
+    use crate::ccr::{content_key, CcrStore};
 
     pub const MIN_COMPRESSIBLE_BYTES: usize = 2048;
     pub const HEAD_LINES: usize = 20;
     pub const TAIL_LINES: usize = 10;
-
-    /// 內容定址 key：sha256 前 16 碼。與 Python 的 ccr.content_key 一致。
-    fn content_key(text: &str) -> String {
-        hex::encode(Sha256::digest(text.as_bytes()))[..16].to_string()
-    }
 
     /// 確定性截斷：頭 + 標記 + 尾。行數不夠回 None。
     /// 標記格式必須與 Python 版逐字相同 —— 跨語言 parity 的前提。
@@ -44,12 +45,21 @@ pub mod live_zone {
         Some(parts.join("\n"))
     }
 
-    /// 入口：live-zone 壓縮。
+    /// 入口：live-zone 壓縮（不收存原文 —— M1/M5 的原始行為）。
+    pub fn compress_request(raw: &[u8]) -> Cow<'_, [u8]> {
+        compress_request_with_store(raw, None)
+    }
+
+    /// 入口：live-zone 壓縮 + 可選 CCR store（M4 整合）。
     ///
     /// 回傳 `Cow::Borrowed(raw)` = 沒事可做，原 bytes 本人；
     /// 回傳 `Cow::Owned(..)` = 真的壓到了，規範化重新序列化。
     /// 任何失敗一律 Borrowed 放行 —— 壓縮永遠不准弄壞請求。
-    pub fn compress_request(raw: &[u8]) -> Cow<'_, [u8]> {
+    /// store 給了就在壓縮前收存原文 —— 永不丟資料。
+    pub fn compress_request_with_store<'a>(
+        raw: &'a [u8],
+        mut store: Option<&mut CcrStore>,
+    ) -> Cow<'a, [u8]> {
         let Ok(mut body) = serde_json::from_slice::<Value>(raw) else {
             return Cow::Borrowed(raw);
         };
@@ -72,7 +82,15 @@ pub mod live_zone {
                                     == Some("tool_result")
                                     && text.len() >= MIN_COMPRESSIBLE_BYTES =>
                             {
-                                squeeze_text(text).filter(|s| s.len() < text.len())
+                                let result = squeeze_text(text);
+                                // 與 Python 版對齊：行數門檻通過就先收存原文
+                                //（即使下面的「沒賺就不動」fallback 之後放棄壓縮）
+                                if result.is_some() {
+                                    if let Some(s) = store.as_deref_mut() {
+                                        s.put(text);
+                                    }
+                                }
+                                result.filter(|s| s.len() < text.len())
                             }
                             _ => None,
                         };
