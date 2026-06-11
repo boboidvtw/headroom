@@ -44,12 +44,20 @@ def _forward_request_headers(headers: httpx.Headers | dict) -> dict[str, str]:
     }
 
 
-def create_app(*, upstream_base_url: str, client: httpx.AsyncClient) -> FastAPI:
+def create_app(
+    *,
+    upstream_base_url: str,
+    client: httpx.AsyncClient,
+    transform=None,
+) -> FastAPI:
     """建立一個把所有路徑 byte-faithful 轉發到 upstream_base_url 的 proxy app。
 
     Args:
         upstream_base_url: 上游基底，例如 "https://api.anthropic.com"。
         client: 已建好的 httpx.AsyncClient（測試時注入 MockTransport）。
+        transform: 可選的 bytes -> bytes 轉換（例如 live_zone.compress_request）。
+            None（預設）= 純 passthrough。引擎契約：不該動的輸入必須
+            原樣回傳「原始 bytes 本人」，proxy 不替它把關。
     """
     upstream_base_url = upstream_base_url.rstrip("/")
     app = FastAPI()
@@ -61,6 +69,8 @@ def create_app(*, upstream_base_url: str, client: httpx.AsyncClient) -> FastAPI:
     async def passthrough(path: str, request: Request) -> Response:
         # (1) 取出「原始 bytes」——這是整個 proxy 的神聖輸入，絕不解析重序列化。
         raw_body = await request.body()
+        if transform is not None and request.method == "POST":
+            raw_body = transform(raw_body)
 
         url = f"{upstream_base_url}/{path}"
         if request.url.query:

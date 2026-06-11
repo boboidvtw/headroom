@@ -64,6 +64,26 @@ async def test_passthrough_body_is_byte_faithful(captured_upstream):
     assert hashlib.sha256(captured["body"]).hexdigest() == sent_hash
 
 
+async def test_transform_is_applied_when_injected(captured_upstream):
+    """接線測試：注入 transform 後，上游收到的是 transform 的輸出。
+
+    proxy 本身保持笨蛋（永遠轉發 bytes）；要不要壓縮由呼叫端
+    決定要不要注入引擎 —— 預設不注入，M0 的神聖性自動成立。
+    """
+    upstream_client, captured = captured_upstream
+    app = create_app(
+        upstream_base_url="https://api.anthropic.com",
+        client=upstream_client,
+        transform=lambda raw: raw + b"!",  # 假引擎：可觀察的最小變換
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://proxy") as client:
+        await client.post("/v1/messages", content=b"abc")
+
+    assert captured["body"] == b"abc!"
+
+
 async def test_unicode_not_ascii_escaped(captured_upstream):
     """單獨盯死 unicode：上游收到的應是 UTF-8 原 bytes，不是 \\uXXXX。"""
     upstream_client, captured = captured_upstream
