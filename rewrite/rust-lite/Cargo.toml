@@ -1,0 +1,16 @@
+# headroom-lite-rs — 學習重建第二幕：把 Python 驗證過的核心 port 到 Rust。
+# 兩個 serde_json feature 是生存前提（計劃 PR-A4）：
+#   arbitrary_precision — 數字保留原始字面值（1.50 不會變 1.5）
+#   preserve_order      — object key 順序保留（不被 BTreeMap 重排）
+[package]
+name = "headroom-lite-rs"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# 獨立於 repo 根目錄的 workspace（學習用 crate，不混入正式 crates/*）
+[workspace]

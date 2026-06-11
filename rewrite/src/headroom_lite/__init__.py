@@ -18,6 +18,8 @@
   M2  byte-level SSE 狀態機               （Phase C 之魂）✅
   M3  cache 穩定化                        （Phase E 之魂）✅
   M4  CCR 可逆取回                        （鐵律 4 / B7）✅
+  M5  Rust port（rust-lite/）             （Phase C/I 之魂）✅
+      Cow fallback、arbitrary_precision、跨語言 parity byte-for-byte
 
 完整 pipeline（每請求、順序固定）：
   compress_request(stabilize_request(register_ccr_tool(raw)), store=store)
