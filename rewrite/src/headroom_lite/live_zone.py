@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+
+from headroom_lite.ccr import content_key
 
 # 只有「夠大」的 tool_result 才值得壓：太小的省不了幾個 token，
 # 卻要付出重新序列化整個 body 的 cache 風險。門檻對齊計劃 B4 的精神。
@@ -27,25 +28,28 @@ HEAD_LINES = 20
 TAIL_LINES = 10
 
 
-def _squeeze_text(text: str) -> str:
+def _squeeze_text(text: str, store=None) -> str:
     """確定性壓縮一段長文字：頭 + 標記 + 尾。
 
     標記內含「原文 SHA-256 前 16 碼 + 省略行數」：
       - hash 讓同一份原文永遠產生同一個標記（確定性的證明書），
-        也讓日後 CCR（可逆取回）能用 hash 當 key 找回原文。
+        同時就是 CCR store 的取回 key —— content_key 是唯一的
+        真相來源，標記與 store 永遠對得上。
       - 絕不放時間戳或隨機值 —— 那會讓第 N+1 輪重壓結果不同。
     """
     lines = text.splitlines()
     if len(lines) <= HEAD_LINES + TAIL_LINES:
         return text  # 行數太少，沒得壓
 
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    if store is not None:
+        store.put(text)  # 壓縮前先收好原文 —— 永不丟資料
+    digest = content_key(text)
     omitted = len(lines) - HEAD_LINES - TAIL_LINES
     marker = f"[... headroom-lite squeezed {omitted} lines | sha256:{digest} ...]"
     return "\n".join([*lines[:HEAD_LINES], marker, *lines[-TAIL_LINES:]])
 
 
-def _compress_block(block: dict) -> dict:
+def _compress_block(block: dict, store=None) -> dict:
     """壓一個 content block。非 tool_result 或不夠大 → 原物件原樣回傳。
 
     回傳新 dict（不可變風格），絕不就地修改輸入。
@@ -58,16 +62,17 @@ def _compress_block(block: dict) -> dict:
     if len(content.encode("utf-8")) < MIN_COMPRESSIBLE_BYTES:
         return block
 
-    squeezed = _squeeze_text(content)
+    squeezed = _squeeze_text(content, store)
     if len(squeezed) >= len(content):
         return block  # 驗證 + fallback：沒賺就不動
     return {**block, "content": squeezed}
 
 
-def compress_request(raw: bytes) -> bytes:
+def compress_request(raw: bytes, *, store=None) -> bytes:
     """入口：對 /v1/messages 的 body bytes 做 live-zone 壓縮。
 
     只在「真的壓到東西」時才重新序列化；否則回傳原始 bytes 本人。
+    store（可選）：CCRStore —— 給了就在壓縮前收存原文，可逆取回。
     """
     try:
         body = json.loads(raw)
@@ -87,7 +92,7 @@ def compress_request(raw: bytes) -> bytes:
     if not isinstance(content, list):
         return raw
 
-    new_blocks = [_compress_block(b) if isinstance(b, dict) else b for b in content]
+    new_blocks = [_compress_block(b, store) if isinstance(b, dict) else b for b in content]
     if all(nb is ob for nb, ob in zip(new_blocks, content)):
         return raw  # 一個 block 都沒壓到 → 原始 bytes 直接回家
 

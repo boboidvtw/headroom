@@ -13,10 +13,14 @@
   4. 可逆且狀態穩定。
 
 學習里程碑：
-  M0  byte-faithful passthrough proxy   ← 現在這裡（Phase A 之魂）
-  M1  live-zone 壓縮                      （Phase B 之魂）
-  M2  byte-level SSE 狀態機               （Phase C 之魂）
-  M3  cache 穩定化                        （Phase E 之魂）
+  M0  byte-faithful passthrough proxy     （Phase A 之魂）✅
+  M1  live-zone 壓縮                      （Phase B 之魂）✅
+  M2  byte-level SSE 狀態機               （Phase C 之魂）✅
+  M3  cache 穩定化                        （Phase E 之魂）✅
+  M4  CCR 可逆取回                        （鐵律 4 / B7）✅
+
+完整 pipeline（每請求、順序固定）：
+  compress_request(stabilize_request(register_ccr_tool(raw)), store=store)
 """
 
 __version__ = "0.0.0"
