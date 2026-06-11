@@ -33,6 +33,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M3 | `ac7f098` | cache stabilization | tool normalization; `dict ==` ignores key order (real bug caught) |
 | M4 | `2a0f018` | CCR reversible retrieval | content-addressed store; register tool on EVERY request |
 | M5 | `77b37c3` | Rust port + parity | `Cow` typed fallback; `arbitrary_precision`+`preserve_order`; Py/Rs SHA-256 identical |
+| M6 | `200eba0` | Rust port of M3+M4 + full Rust pipeline + scripted parity gate | `Cow` relay: all-`Borrowed` ⇒ original bytes; serde_json `Value ==` ignores key order — compare serialized bytes; Python's `store.put` timing is hidden spec |
 
 ## Run / 執行
 
@@ -41,10 +42,10 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 cd rewrite && uv run pytest -q              # 30 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 11 tests
+cd rewrite/rust-lite && cargo test          # 30 tests
 
-# Cross-language parity / 跨語言 parity
-cargo build --example compress_stdin --manifest-path rust-lite/Cargo.toml
+# Cross-language parity gate / 跨語言 parity gate（4 fixtures, byte-for-byte）
+cd rewrite && ./scripts/parity.sh
 ```
 
 ## Pipeline
@@ -52,4 +53,9 @@ cargo build --example compress_stdin --manifest-path rust-lite/Cargo.toml
 ```python
 # deterministic ∘ deterministic = deterministic — the whole architecture in one line
 compress_request(stabilize_request(register_ccr_tool(raw)), store=store)
+```
+
+```rust
+// Rust equivalent — Cow lifetime relay; Borrowed only if no stage touched the bytes
+pipeline::process_request(raw, Some(&mut store))
 ```
