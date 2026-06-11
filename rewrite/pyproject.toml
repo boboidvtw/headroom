@@ -1,0 +1,28 @@
+# headroom-lite — 跟著 REALIGNMENT 計劃「親手建一遍」的學習重建版（Python 先行）。
+# 北極星：passthrough is sacred；只壓縮 live zone。
+[project]
+name = "headroom-lite"
+version = "0.0.0"
+description = "Learning rebuild of headroom following the REALIGNMENT plan (Python-first)."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/headroom_lite"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
