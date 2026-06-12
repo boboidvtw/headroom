@@ -34,6 +34,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M4 | `2a0f018` | CCR reversible retrieval | content-addressed store; register tool on EVERY request |
 | M5 | `77b37c3` | Rust port + parity | `Cow` typed fallback; `arbitrary_precision`+`preserve_order`; Py/Rs SHA-256 identical |
 | M6 | `200eba0` | Rust port of M3+M4 + full Rust pipeline + scripted parity gate | `Cow` relay: all-`Borrowed` ⇒ original bytes; serde_json `Value ==` ignores key order — compare serialized bytes; Python's `store.put` timing is hidden spec |
+| M7 | `bf024e4` | axum HTTP proxy + streaming SSE re-chunking | boundary-preserving frames: `concat(frames)+remaining == input`; never hold a `MutexGuard` across `await`; `reqwest` without gzip feature = no silent decompression |
 
 ## Run / 執行
 
@@ -42,10 +43,14 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 cd rewrite && uv run pytest -q              # 30 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 30 tests
+cd rewrite/rust-lite && cargo test          # 40 tests
 
 # Cross-language parity gate / 跨語言 parity gate（4 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
+
+# Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
+cd rewrite/rust-lite && cargo run --example proxy_server
+UPSTREAM=http://127.0.0.1:9999 PORT=8787 cargo run --example proxy_server  # override
 ```
 
 ## Pipeline
