@@ -74,6 +74,8 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: Request) -> Response
         return error_response(StatusCode::BAD_REQUEST, "failed to read request body");
     };
 
+    let in_len = raw.len(); // raw 之後會被 move，先記長度供觀測線用
+
     // 只有 POST 過引擎（/v1/messages 形狀的 body 才有 live zone 可壓；
     // 引擎對非目標 body 的契約本來就是 Borrowed 放行）。
     // 大括號刻意縮小 MutexGuard 的存活範圍 —— 不能抱著鎖跨 await。
@@ -94,6 +96,16 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: Request) -> Response
         .path_and_query()
         .map_or("/", |pq| pq.as_str());
     let url = format!("{}{}", state.upstream, path_and_query);
+
+    // 觀測線（stderr）：in == out 代表 pipeline 全程 Borrowed（原 bytes 本人）
+    eprintln!(
+        "{} {} in={}B out={}B{}",
+        parts.method,
+        path_and_query,
+        in_len,
+        body_bytes.len(),
+        if in_len != body_bytes.len() { "  [transformed]" } else { "" }
+    );
 
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &parts.headers {
