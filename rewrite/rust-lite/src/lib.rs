@@ -11,6 +11,7 @@
 pub mod cache_stabilization;
 pub mod ccr;
 pub mod pipeline;
+pub mod proxy;
 
 pub mod live_zone {
     //! live-zone 壓縮引擎（與 Python 版行為 / 標記格式逐字對齊）。
@@ -137,8 +138,38 @@ pub mod sse {
 
         /// 吞下一個 chunk，吐出「此刻已完整」的事件 bytes。
         pub fn feed(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+            // frame 含邊界；事件視圖把邊界剝掉 —— 單一切割邏輯，兩種視圖
+            self.split_frames(chunk)
+                .into_iter()
+                .map(|(frame, sep_len)| {
+                    let mut event = frame;
+                    event.truncate(event.len() - sep_len);
+                    event
+                })
+                .collect()
+        }
+
+        /// M7：吞下一個 chunk，吐出「含原始邊界 bytes」的完整事件 frame。
+        ///
+        /// 與 `feed` 的差別：frame 是回程重組用的 —— 必須能逐字節還原，
+        /// 所以 `\n\n` / `\r\n\r\n` 哪種結尾都原樣保留。
+        /// 不變量：concat(所有 frames) + `take_remaining()` == 所有輸入。
+        pub fn feed_frames(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+            self.split_frames(chunk)
+                .into_iter()
+                .map(|(frame, _)| frame)
+                .collect()
+        }
+
+        /// 取走緩衝區剩餘 bytes（串流結束時的最後沖洗）。
+        pub fn take_remaining(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.buffer)
+        }
+
+        /// 共同核心：切出 (含邊界的 frame, 邊界長度) 序列。
+        fn split_frames(&mut self, chunk: &[u8]) -> Vec<(Vec<u8>, usize)> {
             self.buffer.extend_from_slice(chunk);
-            let mut events = Vec::new();
+            let mut frames = Vec::new();
             loop {
                 // 找最早出現的事件邊界（兩種行尾都看）
                 let earliest = BOUNDARIES
@@ -146,9 +177,9 @@ pub mod sse {
                     .filter_map(|sep| find(&self.buffer, sep).map(|i| (i, sep.len())))
                     .min_by_key(|&(i, _)| i);
                 let Some((cut, sep_len)) = earliest else {
-                    return events; // 沒有完整事件了，剩的繼續緩衝
+                    return frames; // 沒有完整事件了，剩的繼續緩衝
                 };
-                events.push(self.buffer[..cut].to_vec());
+                frames.push((self.buffer[..cut + sep_len].to_vec(), sep_len));
                 self.buffer.drain(..cut + sep_len);
             }
         }

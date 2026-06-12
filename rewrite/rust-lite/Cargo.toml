@@ -12,5 +12,14 @@ serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision
 sha2 = "0.10"
 hex = "0.4"
 
+# M7 — HTTP 層（與工業版 crates/headroom-proxy 同棧，便於對照解答本）。
+# reqwest 刻意 default-features=false：不開 gzip/brotli 自動解壓，
+# 上游回什麼 bytes 就轉什麼 bytes —— byte-faithful 的回程前提。
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures = "0.3"
+bytes = "1"
+
 # 獨立於 repo 根目錄的 workspace（學習用 crate，不混入正式 crates/*）
 [workspace]

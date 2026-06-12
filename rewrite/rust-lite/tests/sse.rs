@@ -48,3 +48,49 @@ fn crlf_boundaries_supported() {
     let mut splitter = SseByteSplitter::new();
     assert_eq!(splitter.feed(&raw), vec![b"data: {}".to_vec()]);
 }
+
+// ---- M7：boundary-preserving frames（proxy 回程重切用）----
+//
+// `feed` 吐的事件「不含」邊界 bytes —— 拿來重組回程會丟失
+// 「這事件原本是 \n\n 還是 \r\n\r\n 結尾」的資訊，byte-faithful 必炸。
+// `feed_frames` 吐的 frame「含」原始邊界 bytes，數學性質：
+//   concat(所有 frames) + take_remaining() == 所有餵進去的 bytes
+
+#[test]
+fn frames_include_original_boundary_bytes() {
+    let mut splitter = SseByteSplitter::new();
+    let frames = splitter.feed_frames(b"data: a\n\ndata: b\r\n\r\n");
+    assert_eq!(
+        frames,
+        vec![b"data: a\n\n".to_vec(), b"data: b\r\n\r\n".to_vec()]
+    );
+}
+
+#[test]
+fn frames_concat_plus_remaining_equals_input() {
+    // 故意切在事件中間 + emoji 中間的最壞 chunk 序列
+    let raw = format!(
+        "event: ping\ndata: {{}}\r\n\r\n{}data: 尾巴沒結束",
+        String::from_utf8(event("🔥 你好")).unwrap()
+    )
+    .into_bytes();
+
+    let mut splitter = SseByteSplitter::new();
+    let mut reassembled = Vec::new();
+    for chunk in raw.chunks(3) {
+        for frame in splitter.feed_frames(chunk) {
+            reassembled.extend(frame);
+        }
+    }
+    reassembled.extend(splitter.take_remaining());
+    // 一個 byte 都不准多、不准少、不准變
+    assert_eq!(reassembled, raw);
+}
+
+#[test]
+fn take_remaining_drains_buffer() {
+    let mut splitter = SseByteSplitter::new();
+    assert!(splitter.feed_frames(b"data: incomplete").is_empty());
+    assert_eq!(splitter.take_remaining(), b"data: incomplete".to_vec());
+    assert!(splitter.take_remaining().is_empty()); // 拿過就空了
+}
