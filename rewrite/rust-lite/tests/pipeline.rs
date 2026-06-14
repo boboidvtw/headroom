@@ -1,7 +1,8 @@
-//! M6 安全網：全 Rust pipeline —— register_ccr_tool → stabilize_request → compress。
+//! M8 安全網：lazy registration —— stabilize → compress →（有壓到才 register）。
 //!
-//! 對齊 Python 側的一行：compress_request(stabilize_request(register_ccr_tool(raw)), store=store)。
-//! Rust 版的挑戰是 Cow 的生命週期接力：三段都 Borrowed 才回 Borrowed（原始 bytes 本人）。
+//! 對齊 Python 側 headroom_lite.pipeline.process_request。
+//! Cow 接力契約：三段都沒動 → Borrowed（原始 bytes 本人）；
+//! 有壓到才註冊 ccr_retrieve（接 tools 尾端，不重排 —— cache 前綴保留最大化）。
 
 use std::borrow::Cow;
 
@@ -38,18 +39,15 @@ fn pipeline_applies_all_three_stages() {
     let mut store = CcrStore::new();
     let out: Value = serde_json::from_slice(&process_request(&raw, Some(&mut store))).unwrap();
 
-    // M4：ccr_retrieve 已註冊
     let names: Vec<&str> = out["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"ccr_retrieve"));
-    // M3：tools 已按名字排序（ccr_retrieve < read_file < write_file）
-    let mut sorted = names.clone();
-    sorted.sort();
-    assert_eq!(names, sorted);
+    // M3：client tools 按名字排序（read_file < write_file）
+    // M8：有壓到 → ccr_retrieve 已註冊，且接在尾端（不排到最前面 —— cache 前綴保留最大化）
+    assert_eq!(names, vec!["read_file", "write_file", "ccr_retrieve"]);
     // M3：零標記 → 自動補 cache_control（live zone 前的最後一則訊息）
     let messages = out["messages"].as_array().unwrap();
     let frozen_blocks = messages[messages.len() - 2]["content"].as_array().unwrap();
@@ -58,6 +56,34 @@ fn pipeline_applies_all_three_stages() {
     let squeezed = messages.last().unwrap()["content"][0]["content"].as_str().unwrap();
     assert!(squeezed.contains("headroom-lite squeezed"));
     assert_eq!(store.len(), 1);
+}
+
+#[test]
+fn pipeline_lazy_skips_registration_when_nothing_compressed() {
+    // M8 頭號契約：這輪沒壓到任何東西 → tools 不長出 ccr_retrieve（lazy 的核心）。
+    let raw = serde_json::to_vec(&json!({
+        "model": "claude-opus-4-8",
+        "tools": [
+            {"name": "read_file", "description": "讀檔", "input_schema": {"type": "object"}},
+        ],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "short output"},
+            ]},
+        ],
+    }))
+    .unwrap();
+
+    let mut store = CcrStore::new();
+    let out: Value = serde_json::from_slice(&process_request(&raw, Some(&mut store))).unwrap();
+    let names: Vec<&str> = out["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.contains(&"ccr_retrieve")); // 沒壓 → 不註冊
+    assert_eq!(store.len(), 0); // 沒收存任何原文
 }
 
 #[test]

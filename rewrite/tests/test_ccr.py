@@ -3,8 +3,8 @@
 對應北極星鐵律 4 + 計劃 B7：
   1. 壓縮永不丟資料 —— 原文存進 content-addressed store，
      標記裡的 sha256 就是取回 key。
-  2. ccr_retrieve 工具「每請求都註冊」—— 包括沒壓到東西的請求。
-     時有時無 = tools 陣列閃爍 = cache 前綴炸掉（原版的 bug）。
+  2. register_ccr_tool 是「無條件」的純 building block —— 被呼叫就註冊。
+     （「何時呼叫」的 lazy 決策在 pipeline 層，見 test_pipeline.py / M8。）
   3. 工具定義 bytes 跨輪逐字節穩定。
 """
 
@@ -56,10 +56,13 @@ def test_compress_without_store_still_works():
     assert len(out) < len(_body_with_big_tool_result())
 
 
-# ------------------------------------------------- 每請求都註冊
+# ------------------------------------------------- building block：被叫到就註冊
 
 def test_tool_registered_even_when_nothing_compressed():
-    """鐵律 4 核心：這輪沒壓到任何東西，工具照樣要在。"""
+    """building block 契約：register_ccr_tool 被呼叫就無條件註冊。
+
+    （pipeline 才負責「沒壓到就別呼叫」的 lazy 決策 —— 見 test_pipeline.py。）
+    """
     tiny = json.dumps({
         "model": "claude-opus-4-8",
         "tools": [{"name": "read_file", "description": "讀檔",

@@ -20,9 +20,14 @@
   M4  CCR 可逆取回                        （鐵律 4 / B7）✅
   M5  Rust port（rust-lite/）             （Phase C/I 之魂）✅
       Cow fallback、arbitrary_precision、跨語言 parity byte-for-byte
+  M6  Rust port M3+M4（全 Rust pipeline + parity gate 腳本化）✅
+  M7  axum HTTP proxy（串流轉發 + SSE boundary-preserving 重切）✅
+  M8  lazy registration（有壓到才註冊 ccr_retrieve）✅
 
-完整 pipeline（每請求、順序固定）：
-  compress_request(stabilize_request(register_ccr_tool(raw)), store=store)
+完整 pipeline（M8 lazy registration）：
+  headroom_lite.pipeline.process_request(raw, store=store)
+  順序：stabilize_request → compress_request →（有壓到才 register_ccr_tool）
+  —— 多數請求不壓縮 → tools 全程不動 → 零 cache 影響。
 """
 
 __version__ = "0.0.0"

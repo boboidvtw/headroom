@@ -6,8 +6,11 @@
 //!   - content-addressed 的妙處：key 由內容決定，同文必同 key，
 //!     store 天然去重、不需要任何協調或序號。
 //!
-//! 鐵律 4：ccr_retrieve「每請求都註冊」—— 包括這輪什麼都沒壓的請求。
-//! tools 陣列在 cache 前綴最前面，工具時有時無 = 前綴閃爍 = cache 炸。
+//! register_ccr_tool 是「無條件」的純 building block：呼叫它就註冊。
+//! 「何時呼叫」的決策在 pipeline 層（M8 lazy registration）—— 只在這輪
+//! 真的壓到東西時才註冊，否則 tools 一個 byte 都不動。
+//! 歷史教訓（2026-06-12 live traffic）：原設計每請求都註冊，害上游對
+//! raw 流量的部分命中容錯失效；M8 改 lazy 治本。
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -78,8 +81,9 @@ fn ccr_retrieve_tool() -> Value {
     })
 }
 
-/// 把 ccr_retrieve 註冊進 body 的 tools 陣列 —— 無條件、每請求。
+/// 把 ccr_retrieve 註冊進 body 的 tools 陣列 —— 無條件（building block）。
 ///
+/// 註冊時機由 pipeline 決定（M8 lazy：有壓到才呼叫）。接在 tools 尾端。
 /// 已存在（冪等）或壞輸入 → `Cow::Borrowed`（原始 bytes 本人）。
 pub fn register_ccr_tool(raw: &[u8]) -> Cow<'_, [u8]> {
     let Ok(mut body) = serde_json::from_slice::<Value>(raw) else {

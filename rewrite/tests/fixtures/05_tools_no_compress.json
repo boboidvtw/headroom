@@ -1,0 +1,13 @@
+{
+  "model": "claude-opus-4-8",
+  "tools": [
+    {"name": "write_file", "description": "寫檔", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+    {"name": "read_file", "description": "讀檔", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+  ],
+  "system": "你是嚴謹的助理。",
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "幫我讀一下設定檔"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "好的，我來讀。"}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "OK done"}]}
+  ]
+}

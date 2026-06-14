@@ -8,9 +8,13 @@
   - content-addressed 的妙處：key 由內容決定，同文必同 key，
     store 天然去重、不需要任何協調或序號。
 
-鐵律 4（計劃 B7）：ccr_retrieve「每請求都註冊」—— 包括這輪
-什麼都沒壓的請求。tools 陣列在 cache 前綴最前面，工具時有時無
-= 前綴閃爍 = cache 炸（原版的 bug 正是如此）。
+register_ccr_tool 是「無條件」的純 building block：呼叫它就註冊。
+「何時呼叫」的決策在 pipeline 層（見 pipeline.py / M8 lazy registration）
+—— 只在這輪真的壓到東西時才註冊，否則 tools 一個 byte 都不動。
+
+歷史教訓（2026-06-12 live traffic 實測）：原設計每請求都先註冊
+ccr_retrieve，無條件動 tools（cache 前綴最前面），害上游對 raw 流量
+的部分命中容錯失效。M8 把註冊改成 lazy —— 治本。
 """
 
 from __future__ import annotations
@@ -72,8 +76,10 @@ CCR_RETRIEVE_TOOL = {
 
 
 def register_ccr_tool(raw: bytes) -> bytes:
-    """把 ccr_retrieve 註冊進 body 的 tools 陣列 —— 無條件、每請求。
+    """把 ccr_retrieve 註冊進 body 的 tools 陣列 —— 無條件（building block）。
 
+    註冊時機由 pipeline 決定（M8 lazy：有壓到才呼叫）；這個函式本身
+    只管「被叫到就把工具加進去」。接在 tools 尾端，cache 前綴保留最大化。
     已存在（冪等）或壞輸入 → 回傳原始 bytes 本人。
     """
     try:
