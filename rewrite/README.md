@@ -36,6 +36,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M6 | `200eba0` | Rust port of M3+M4 + full Rust pipeline + scripted parity gate | `Cow` relay: all-`Borrowed` ⇒ original bytes; serde_json `Value ==` ignores key order — compare serialized bytes; Python's `store.put` timing is hidden spec |
 | M7 | `bf024e4` | axum HTTP proxy + streaming SSE re-chunking | boundary-preserving frames: `concat(frames)+remaining == input`; never hold a `MutexGuard` across `await`; `reqwest` without gzip feature = no silent decompression |
 | M7.5 | `4b91dd5` | live-traffic validation + per-request observability line | vs real API: full cache hit on identical bodies (determinism proven live), −81.6% input tokens on big tool_results; **but** wrapping real Claude Code revealed `register_ccr_tool` mutating `tools` zeroes cross-process cache reads → M8 = lazy registration |
+| M8 | `da29a03` | lazy registration — register CCR tool only when something compressed | decision moves from building block to orchestration layer; signal = compress returns same object (Py) / `Cow::Borrowed` (Rust); append CCR at tools **tail**, not sorted to front — prefix cache keeps client tools byte-identical, pushes divergence point later |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -44,26 +45,27 @@ Three live experiments against `api.anthropic.com` all passed (cache preserved,
 real Claude Code session then exposed two things curl could not: Claude Code's
 own `Agent` tool description is nondeterministic across processes, and adding
 *any* tool (our CCR registration) forfeits the API's partial-cache resilience
-for cross-process traffic. Next milestone: register the CCR tool lazily — only
-on requests that actually compressed something.
+for cross-process traffic. **M8 (`da29a03`) fixed this**: the CCR tool is now
+registered lazily — only on requests that actually compressed something — so
+most requests leave `tools` untouched (zero cache impact).
 
 對真 `api.anthropic.com` 的三項實驗全過（cache 不破、input tokens 省 81.6%
 且答案品質不變、SSE 完整）。接著 wrap 真的 Claude Code session，抓到 curl
 抓不到的兩件事：Claude Code 自己的 `Agent` tool description 跨 process 不
 確定；而我們在 tools 註冊 CCR 工具，會讓 API 對跨 process 流量的部分命中
-容錯完全失效。下一個里程碑：lazy registration —— 只在真的壓縮了的請求上
-註冊工具。
+容錯完全失效。**M8（`da29a03`）已治本**：CCR 工具改成 lazy 註冊 —— 只在
+真的壓縮了的請求上註冊，多數請求 `tools` 全程不動（零 cache 影響）。
 
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 30 tests
+cd rewrite && uv run pytest -q              # 37 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 40 tests
+cd rewrite/rust-lite && cargo test          # 41 tests
 
-# Cross-language parity gate / 跨語言 parity gate（4 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（5 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
@@ -74,8 +76,9 @@ UPSTREAM=http://127.0.0.1:9999 PORT=8787 cargo run --example proxy_server  # ove
 ## Pipeline
 
 ```python
-# deterministic ∘ deterministic = deterministic — the whole architecture in one line
-compress_request(stabilize_request(register_ccr_tool(raw)), store=store)
+# M8 lazy registration — stabilize → compress → register only if something compressed
+# deterministic ∘ deterministic = deterministic; most requests leave tools untouched
+headroom_lite.pipeline.process_request(raw, store=store)
 ```
 
 ```rust
