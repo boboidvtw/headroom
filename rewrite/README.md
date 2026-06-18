@@ -37,6 +37,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M7 | `bf024e4` | axum HTTP proxy + streaming SSE re-chunking | boundary-preserving frames: `concat(frames)+remaining == input`; never hold a `MutexGuard` across `await`; `reqwest` without gzip feature = no silent decompression |
 | M7.5 | `4b91dd5` | live-traffic validation + per-request observability line | vs real API: full cache hit on identical bodies (determinism proven live), −81.6% input tokens on big tool_results; **but** wrapping real Claude Code revealed `register_ccr_tool` mutating `tools` zeroes cross-process cache reads → M8 = lazy registration |
 | M8 | `da29a03` | lazy registration — register CCR tool only when something compressed | decision moves from building block to orchestration layer; signal = compress returns same object (Py) / `Cow::Borrowed` (Rust); append CCR at tools **tail**, not sorted to front — prefix cache keeps client tools byte-identical, pushes divergence point later |
+| M9 | `fd2e135` | CCR retrieve wired into the proxy — side-channel endpoint + server-side resolve loop | `POST /ccr/retrieve` exposes the store (200/404); the resolve loop intercepts the model's `ccr_retrieve` tool_use, serves the original from the store, and re-calls upstream until a real answer — the client never sees the injected tool; only fires on POST `/v1/messages` JSON responses, leaves SSE & plain JSON byte-faithful, capped at 8 hops; only intercepts when *every* tool_use is ccr_retrieve (foreign tools pass through untouched) |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -63,7 +64,7 @@ most requests leave `tools` untouched (zero cache impact).
 cd rewrite && uv run pytest -q              # 37 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 41 tests
+cd rewrite/rust-lite && cargo test          # 47 tests
 
 # Cross-language parity gate / 跨語言 parity gate（5 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
@@ -85,3 +86,24 @@ headroom_lite.pipeline.process_request(raw, store=store)
 // Rust equivalent — Cow lifetime relay; Borrowed only if no stage touched the bytes
 pipeline::process_request(raw, Some(&mut store))
 ```
+
+## CCR Retrieve / 取回 (M9)
+
+Compression never loses data — the original is stashed in a content-addressed
+store keyed by the `sha256:KEY` you see in the marker. Two ways to get it back:
+
+- **Side-channel**: `POST /ccr/retrieve {"key":"..."}` → `200 {key,content}` or `404`.
+- **Closed loop** (transparent): when the model calls the injected `ccr_retrieve`
+  tool, the proxy serves the original from the store and re-calls upstream until a
+  real answer comes back. The client never sees the injected tool. Runs only on
+  `POST /v1/messages` JSON responses; SSE and plain JSON stay byte-faithful;
+  foreign tool calls pass through untouched; capped at 8 hops.
+
+壓縮永不丟資料 —— 原文存在 content-addressed store，key 就是標記裡的
+`sha256:KEY`。兩種取回方式：
+
+- **側信道**：`POST /ccr/retrieve {"key":"..."}` → `200 {key,content}` 或 `404`。
+- **閉環**（透明）：模型呼叫注入的 `ccr_retrieve` 工具時，proxy 自己從 store
+  取原文、重呼上游，直到拿到真答案 —— client 全程看不到這個工具。只在
+  `POST /v1/messages` 的 JSON 回應上啟動；SSE 與普通 JSON 維持 byte-faithful；
+  非 ccr_retrieve 的工具呼叫原樣放行；hop 上限 8。
