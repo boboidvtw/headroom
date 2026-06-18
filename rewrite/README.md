@@ -38,6 +38,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M7.5 | `4b91dd5` | live-traffic validation + per-request observability line | vs real API: full cache hit on identical bodies (determinism proven live), −81.6% input tokens on big tool_results; **but** wrapping real Claude Code revealed `register_ccr_tool` mutating `tools` zeroes cross-process cache reads → M8 = lazy registration |
 | M8 | `da29a03` | lazy registration — register CCR tool only when something compressed | decision moves from building block to orchestration layer; signal = compress returns same object (Py) / `Cow::Borrowed` (Rust); append CCR at tools **tail**, not sorted to front — prefix cache keeps client tools byte-identical, pushes divergence point later |
 | M9 | `fd2e135` | CCR retrieve wired into the proxy — side-channel endpoint + server-side resolve loop | `POST /ccr/retrieve` exposes the store (200/404); the resolve loop intercepts the model's `ccr_retrieve` tool_use, serves the original from the store, and re-calls upstream until a real answer — the client never sees the injected tool; only fires on POST `/v1/messages` JSON responses, leaves SSE & plain JSON byte-faithful, capped at 8 hops; only intercepts when *every* tool_use is ccr_retrieve (foreign tools pass through untouched) |
+| M10 | `d5c7220` | SSE streaming `ccr_retrieve` **observe-only** probe | deep-read of the answer key (`sse/anthropic.rs` + proxy `PR-C1`) revealed the industrial choice: streaming byte-passthrough is sacred, the SSE state machine is a passive telemetry tee (`mpsc` + spawned task, never blocks the client), retrieval honoring is **not** done in-stream. Faithful to that: `SseCcrProbe` detects a streamed `ccr_retrieve` call (track tool_use by `index`, accumulate `input_json_delta`, parse at `content_block_stop`) and logs an observability line — **zero bytes touched**. In-stream closure belongs to another layer; the non-stream path already closes the loop (M9) |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -64,7 +65,7 @@ most requests leave `tools` untouched (zero cache impact).
 cd rewrite && uv run pytest -q              # 37 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 47 tests
+cd rewrite/rust-lite && cargo test          # 52 tests
 
 # Cross-language parity gate / 跨語言 parity gate（5 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
@@ -107,3 +108,15 @@ store keyed by the `sha256:KEY` you see in the marker. Two ways to get it back:
   取原文、重呼上游，直到拿到真答案 —— client 全程看不到這個工具。只在
   `POST /v1/messages` 的 JSON 回應上啟動；SSE 與普通 JSON 維持 byte-faithful；
   非 ccr_retrieve 的工具呼叫原樣放行；hop 上限 8。
+
+### Streaming: observe-only / 串流：只觀察 (M10)
+
+For SSE responses the proxy does **not** intercept — faithful to the answer key,
+streaming bytes are sacred. `SseCcrProbe` passively detects a streamed
+`ccr_retrieve` call and logs it; the byte stream is forwarded untouched. Closing
+the loop mid-stream would require buffering (you can't un-send bytes), so it
+belongs to a different layer — the non-stream path (above) is where closure lives.
+
+對 SSE 回應，proxy **不**攔截 —— 忠於解答本，串流 bytes 神聖。`SseCcrProbe`
+被動偵測串流裡的 `ccr_retrieve` 呼叫並記觀測線；byte 流原樣轉發。串流內閉環
+得 buffer（送出去的 bytes 收不回來），屬於別層 —— 閉環在上面的非串流路徑。
