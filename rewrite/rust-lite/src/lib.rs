@@ -184,4 +184,133 @@ pub mod sse {
             }
         }
     }
+
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    /// M10 — SSE 串流裡的 ccr_retrieve **被動觀察**（observe-only）。
+    ///
+    /// 忠於工業版解答本（crates/headroom-proxy/src/sse/anthropic.rs）的選擇：
+    /// byte-passthrough 神聖不可侵 —— 這個 probe 只「看」，一個 byte 都不碰。
+    /// proxy 把每個上游 chunk 同時餵給它；它認出模型對 ccr_retrieve 的呼叫
+    /// 就回報 key，proxy 拿去記觀測線。為什麼不在串流裡攔截取回？因為送出去
+    /// 的 bytes 收不回來，要攔就得 buffer、那就毀了串流 —— 串流內閉環屬於別層。
+    ///
+    /// tool_use 在 Anthropic 串流裡按 `index` 分塊：content_block_start 帶
+    /// type=tool_use 與 name；input 由 input_json_delta 的 partial_json 逐段
+    /// 累積；到 content_block_stop 才湊齊、解析一次取出 key。
+    #[derive(Default)]
+    pub struct SseCcrProbe {
+        splitter: SseByteSplitter,
+        /// index → 正在累積的 tool_use 塊（只追 tool_use；text/thinking 略過）。
+        blocks: HashMap<u64, ToolBlock>,
+    }
+
+    struct ToolBlock {
+        name: String,
+        partial_json: String,
+    }
+
+    impl SseCcrProbe {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// 餵一個 chunk，回傳這次「剛在 content_block_stop 湊齊」的
+        /// ccr_retrieve key 清單（多半為空 / 一個）。純觀察、不改 bytes。
+        pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+            let mut keys = Vec::new();
+            // 復用既有切割器：feed 回傳「剝掉邊界」的完整事件 bytes。
+            for event_bytes in self.splitter.feed(chunk) {
+                if let Some((name, data)) = parse_event(&event_bytes) {
+                    self.apply(&name, &data, &mut keys);
+                }
+            }
+            keys
+        }
+
+        fn apply(&mut self, event_name: &str, data: &[u8], keys: &mut Vec<String>) {
+            let Ok(v) = serde_json::from_slice::<Value>(data) else {
+                return; // 非 JSON data（理論上不會）→ 觀察者沉默放行
+            };
+            let index = v.get("index").and_then(Value::as_u64);
+            match event_name {
+                "content_block_start" => {
+                    let Some(idx) = index else { return };
+                    let cb = v.get("content_block");
+                    let is_tool =
+                        cb.and_then(|c| c.get("type")).and_then(Value::as_str) == Some("tool_use");
+                    if is_tool {
+                        let name = cb
+                            .and_then(|c| c.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        self.blocks.insert(idx, ToolBlock { name, partial_json: String::new() });
+                    }
+                }
+                "content_block_delta" => {
+                    let Some(idx) = index else { return };
+                    let Some(block) = self.blocks.get_mut(&idx) else { return };
+                    let delta = v.get("delta");
+                    if delta.and_then(|d| d.get("type")).and_then(Value::as_str)
+                        == Some("input_json_delta")
+                    {
+                        if let Some(p) =
+                            delta.and_then(|d| d.get("partial_json")).and_then(Value::as_str)
+                        {
+                            block.partial_json.push_str(p);
+                        }
+                    }
+                }
+                "content_block_stop" => {
+                    let Some(idx) = index else { return };
+                    // 塊結束才結算：是 ccr_retrieve 且 input 解得出 key 才回報。
+                    if let Some(block) = self.blocks.remove(&idx) {
+                        if block.name == "ccr_retrieve" {
+                            if let Ok(input) = serde_json::from_str::<Value>(&block.partial_json) {
+                                if let Some(key) = input.get("key").and_then(Value::as_str) {
+                                    keys.push(key.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 把一段「剝掉邊界」的 SSE 事件 bytes 解析成 (event_name, data)。
+    /// 多個 data: 行依 WHATWG SSE 規範以 `\n` 串接；找不到 data: 回 None。
+    fn parse_event(block: &[u8]) -> Option<(String, Vec<u8>)> {
+        let mut event_name: Option<String> = None;
+        let mut data_parts: Vec<&[u8]> = Vec::new();
+        for raw_line in block.split(|&b| b == b'\n') {
+            // 容忍 CRLF：剝掉行尾單一 \r
+            let line = match raw_line.strip_suffix(b"\r") {
+                Some(l) => l,
+                None => raw_line,
+            };
+            if line.is_empty() || line[0] == b':' {
+                continue; // 空行 / 註解（: ping）跳過
+            }
+            let (field, value) = match line.iter().position(|&b| b == b':') {
+                Some(p) => (&line[..p], &line[p + 1..]),
+                None => (line, &line[line.len()..]),
+            };
+            // 規範：值前單一空白要剝掉
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            match field {
+                b"event" => event_name = std::str::from_utf8(value).ok().map(str::to_owned),
+                b"data" => data_parts.push(value),
+                _ => {}
+            }
+        }
+        let name = event_name?;
+        if data_parts.is_empty() {
+            return None;
+        }
+        Some((name, data_parts.join(&b'\n')))
+    }
 }

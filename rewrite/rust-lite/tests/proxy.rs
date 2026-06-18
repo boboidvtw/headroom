@@ -453,6 +453,54 @@ async fn resolve_loop_stops_at_hop_cap() {
 }
 
 #[tokio::test]
+async fn sse_with_ccr_retrieve_stays_byte_faithful() {
+    // M10 observe-only 不變量：就算串流裡模型呼叫了 ccr_retrieve，
+    // proxy 也只「觀察」—— client 收到的 bytes 必須逐字節原封不動。
+    let full: Vec<u8> = [
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ccr_retrieve\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"key\\\":\\\"abc123\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat()
+    .into_bytes();
+    // chunk 邊界切在事件中間 —— 順便驗證重切器在有 probe 的情況下仍不破 bytes
+    let chunks: Vec<Vec<u8>> = full.chunks(9).map(<[u8]>::to_vec).collect();
+
+    let upstream = Router::new().fallback(move || {
+        let chunks = chunks.clone();
+        async move {
+            let stream =
+                futures::stream::iter(chunks.into_iter().map(Ok::<_, std::convert::Infallible>));
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+    });
+    let upstream_url = spawn(upstream).await;
+    let proxy_url = spawn(create_app(upstream_url, reqwest::Client::new())).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/messages"))
+        .body(CANONICAL)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+
+    let mut received = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        received.extend(chunk.unwrap());
+    }
+    assert_eq!(received, full);
+}
+
+#[tokio::test]
 async fn unreachable_upstream_returns_502() {
     // 指向沒人聽的埠 —— proxy 要誠實回 502，不是 panic 或掛著
     let proxy_url = spawn(create_app(

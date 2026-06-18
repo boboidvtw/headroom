@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::ccr::{handle_retrieve, CcrStore};
 use crate::pipeline::process_request;
-use crate::sse::SseByteSplitter;
+use crate::sse::{SseByteSplitter, SseCcrProbe};
 
 /// resolve loop 的 hop 上限：模型若不斷追問（甚至壞掉鬼打牆），
 /// proxy 必須在有限步內收手 —— 永不無限迴圈、永不抱著上游連線不放。
@@ -364,12 +364,18 @@ async fn resolve_loop(
     (status, resp_headers, body)
 }
 
-/// 把上游 byte stream 重切成「每 chunk 一個完整 SSE 事件」的 stream。
+/// 把上游 byte stream 重切成「每 chunk 一個完整 SSE 事件」的 stream，
+/// 並在過程中**被動觀察** ccr_retrieve 呼叫（M10，observe-only）。
 ///
 /// byte-faithful 不變量（tests/sse.rs 驗證）：
 ///   concat(所有輸出) == concat(所有輸入)
 /// 串流結束時 `take_remaining` 沖洗殘料 —— 上游最後沒帶結尾邊界
 /// 的 bytes 也一個不少地交還下游。
+///
+/// M10 tee：每個上游 chunk 在重切之外「另外」餵給 `SseCcrProbe`（單通道、
+/// 不開 task/mpsc —— 學習版本只有一個 consumer）。偵測到模型呼叫
+/// ccr_retrieve 就記一條 stderr 觀測線；**bytes 一個都不動**。忠於解答本：
+/// 串流神聖、狀態機只觀察；串流內取回閉環屬於別層（見 sse::SseCcrProbe）。
 fn rechunk_sse<S, E>(upstream: S) -> impl Stream<Item = Result<Bytes, E>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -377,6 +383,7 @@ where
     struct Rechunk<S> {
         inner: S,
         splitter: SseByteSplitter,
+        probe: SseCcrProbe,
         queue: VecDeque<Bytes>,
         done: bool,
     }
@@ -385,6 +392,7 @@ where
     let state = Rechunk {
         inner: Box::pin(upstream),
         splitter: SseByteSplitter::new(),
+        probe: SseCcrProbe::new(),
         queue: VecDeque::new(),
         done: false,
     };
@@ -399,6 +407,10 @@ where
             }
             match st.inner.next().await {
                 Some(Ok(chunk)) => {
+                    // 被動觀察：偵測到 ccr_retrieve 只記觀測線、不改 bytes。
+                    for key in st.probe.feed(&chunk) {
+                        eprintln!("  [sse] model called ccr_retrieve key={key} (observed, passthrough)");
+                    }
                     for frame in st.splitter.feed_frames(&chunk) {
                         st.queue.push_back(Bytes::from(frame));
                     }
