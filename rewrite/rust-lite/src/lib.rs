@@ -12,6 +12,7 @@ pub mod cache_stabilization;
 pub mod ccr;
 pub mod pipeline;
 pub mod proxy;
+pub mod strategies;
 
 pub mod live_zone {
     //! live-zone 壓縮引擎（與 Python 版行為 / 標記格式逐字對齊）。
@@ -21,29 +22,14 @@ pub mod live_zone {
     use serde_json::Value;
 
     // content_key 的唯一真相來源在 ccr —— 標記與 store 永遠對得上
-    use crate::ccr::{content_key, CcrStore};
+    use crate::ccr::CcrStore;
 
     pub const MIN_COMPRESSIBLE_BYTES: usize = 2048;
-    pub const HEAD_LINES: usize = 20;
-    pub const TAIL_LINES: usize = 10;
 
-    /// 確定性截斷：頭 + 標記 + 尾。行數不夠回 None。
-    /// 標記格式必須與 Python 版逐字相同 —— 跨語言 parity 的前提。
+    /// 確定性截斷已移到 strategies dispatcher（M11）；保留薄委派以維持
+    /// compress_block 的呼叫面不變。內容感知策略接進 STRATEGIES，這裡不必改。
     fn squeeze_text(text: &str) -> Option<String> {
-        let lines: Vec<&str> = text.lines().collect();
-        if lines.len() <= HEAD_LINES + TAIL_LINES {
-            return None;
-        }
-        let omitted = lines.len() - HEAD_LINES - TAIL_LINES;
-        let marker = format!(
-            "[... headroom-lite squeezed {omitted} lines | sha256:{} ...]",
-            content_key(text)
-        );
-        let mut parts: Vec<&str> = Vec::with_capacity(HEAD_LINES + TAIL_LINES + 1);
-        parts.extend(&lines[..HEAD_LINES]);
-        parts.push(&marker);
-        parts.extend(&lines[lines.len() - TAIL_LINES..]);
-        Some(parts.join("\n"))
+        crate::strategies::squeeze_text(text)
     }
 
     /// 入口：live-zone 壓縮（不收存原文 —— M1/M5 的原始行為）。
