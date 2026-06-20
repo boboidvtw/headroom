@@ -39,6 +39,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M8 | `da29a03` | lazy registration — register CCR tool only when something compressed | decision moves from building block to orchestration layer; signal = compress returns same object (Py) / `Cow::Borrowed` (Rust); append CCR at tools **tail**, not sorted to front — prefix cache keeps client tools byte-identical, pushes divergence point later |
 | M9 | `fd2e135` | CCR retrieve wired into the proxy — side-channel endpoint + server-side resolve loop | `POST /ccr/retrieve` exposes the store (200/404); the resolve loop intercepts the model's `ccr_retrieve` tool_use, serves the original from the store, and re-calls upstream until a real answer — the client never sees the injected tool; only fires on POST `/v1/messages` JSON responses, leaves SSE & plain JSON byte-faithful, capped at 8 hops; only intercepts when *every* tool_use is ccr_retrieve (foreign tools pass through untouched) |
 | M10 | `d5c7220` | SSE streaming `ccr_retrieve` **observe-only** probe | deep-read of the answer key (`sse/anthropic.rs` + proxy `PR-C1`) revealed the industrial choice: streaming byte-passthrough is sacred, the SSE state machine is a passive telemetry tee (`mpsc` + spawned task, never blocks the client), retrieval honoring is **not** done in-stream. Faithful to that: `SseCcrProbe` detects a streamed `ccr_retrieve` call (track tool_use by `index`, accumulate `input_json_delta`, parse at `content_block_stop`) and logs an observability line — **zero bytes touched**. In-stream closure belongs to another layer; the non-stream path already closes the loop (M9) |
+| M11 | `4e10def` | pluggable content-sniffing compression strategy dispatcher (skeleton) | pure refactor of live-zone — `Strategy = (applies, squeeze)`, `TRUNCATE` as catch-all; adding log/search/diff later = one strategy + register; `store.put` timing stays inside the strategy (sacred spec); Py/Rs store-side asymmetry but markers byte-identical ⇒ parity holds; proven byte-identical vs pre-refactor across 92 inputs + cross-language differential + adversarial fuzz |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -58,14 +59,45 @@ most requests leave `tools` untouched (zero cache impact).
 容錯完全失效。**M8（`da29a03`）已治本**：CCR 工具改成 lazy 註冊 —— 只在
 真的壓縮了的請求上註冊，多數請求 `tools` 全程不動（零 cache 影響）。
 
+## Notes — M11 (2026-06-19)
+
+M11 was a **pure refactor**: `live_zone` went from hardcoded head/tail truncation to
+a pluggable content-sniffing dispatcher (`Strategy = applies + squeeze`, `TRUNCATE`
+as catch-all). Verified far beyond the unit tests — behavior-equivalence vs the
+pre-M11 version across **92 diverse inputs** (byte-identical + CCR store identical),
+a **cross-language differential** (Python vs Rust `compress_stdin`, zero diff), and
+**adversarial** malformed inputs (zero crashes, all passthrough).
+
+A meta-lesson surfaced: the session that built M11 ran in a corrupted sandbox that
+*rolled back commits and faked success reports* — phantom pushes, a non-existent
+`OPTIMIZATION.md`, a README "M11 update" that was never actually written. The fix
+mirrored this project’s own North Star: when the environment lies, trust only
+**ground truth** — directly-run commands (`git log`, `parity.sh` exit code) and the
+compiler, never wrapped queries. M11’s code landed only because it was rebuilt via a
+self-contained script in a clean terminal, then verified from scratch.
+
+## Notes — M11（2026-06-19）
+
+M11 是**純重構**：`live_zone` 從寫死的頭尾截斷，改為可插拔的 content-sniffing
+dispatcher（`Strategy = applies + squeeze`、`TRUNCATE` 殿後 catch-all）。驗證遠超
+單元測試——對 M11 重構前版本做 **92 個多樣輸入**的行為等價（byte-identical +
+CCR store 一致）、**跨語言 differential**（Python vs Rust `compress_stdin`，零差異）、
+**對抗性**畸形輸入（零崩潰、全 passthrough）。
+
+還浮現一個 meta 教訓：建造 M11 的 session 跑在會**回滾 commit、偽造成功報告**的損壞
+沙箱裡——幻象 push、不存在的 `OPTIMIZATION.md`、從未真正寫入的 README「M11 更新」。
+解法呼應了專案自己的 North Star：環境說謊時，只信 **ground truth**——直跑命令
+（`git log`、`parity.sh` 的 exit code）與編譯器，絕不信包裝過的查詢。M11 的程式碼能
+落地，是因為用自包含腳本在乾淨 terminal 重建，再從零核實。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 37 tests
+cd rewrite && uv run pytest -q              # 48 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 52 tests
+cd rewrite/rust-lite && cargo test          # 62 tests
 
 # Cross-language parity gate / 跨語言 parity gate（5 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
