@@ -52,9 +52,10 @@ fn pipeline_applies_all_three_stages() {
     let messages = out["messages"].as_array().unwrap();
     let frozen_blocks = messages[messages.len() - 2]["content"].as_array().unwrap();
     assert_eq!(frozen_blocks.last().unwrap()["cache_control"], json!({"type": "ephemeral"}));
-    // M1+M4：live zone 壓縮 + 原文可取回
+    // M1+M4：live zone 壓縮 + 原文可取回。不綁特定策略 —— log 內容走 log 策略
+    // （"dropped"）、其他走 truncate（"squeezed"），共用標記前綴，斷言意圖＝壓到了。
     let squeezed = messages.last().unwrap()["content"][0]["content"].as_str().unwrap();
-    assert!(squeezed.contains("headroom-lite squeezed"));
+    assert!(squeezed.contains("[... headroom-lite "));
     assert_eq!(store.len(), 1);
 }
 

@@ -94,9 +94,11 @@ def test_compression_triggers_ccr_registration():
     out = process_request(big, store=store)
 
     assert "ccr_retrieve" in _ccr_names(out)
-    # 壓縮確實發生：live zone 被縮、原文進了 store
+    # 壓縮確實發生：live zone 被縮、原文進了 store。
+    # 不綁特定策略 —— HUGE_LOG 是純 log，M12 起走 log 策略（"dropped"），
+    # 其他內容走 truncate（"squeezed"）；兩者共用標記前綴，斷言意圖＝壓到了。
     squeezed = json.loads(out)["messages"][0]["content"][0]["content"]
-    assert "headroom-lite squeezed" in squeezed
+    assert "[... headroom-lite " in squeezed
     assert len(store) == 1
 
 

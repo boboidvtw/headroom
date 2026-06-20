@@ -114,3 +114,86 @@ def test_unicode_text_deterministic_and_keyed():
     text = "\n".join(f"{line} {i}" for i in range(50))
     assert squeeze_text(text) == squeeze_text(text)
     assert f"sha256:{content_key(text)}" in squeeze_text(text)
+
+
+# ── M12：log 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import LOG, STRATEGIES, _log_squeeze, _severity
+
+
+def _noisy_log(n_errors: int = 5, n_noise: int = 20) -> str:
+    """一份噪音夾雜的 log：error 刻意埋在「中段」（truncate 的盲區）。"""
+    half = n_noise // 2
+    lines = [f"2026-06-20 10:00:{i:02d} DEBUG worker tick {i}" for i in range(half)]
+    lines += [f"2026-06-20 10:01:{i:02d} ERROR db connection failed attempt {i}" for i in range(n_errors)]
+    lines += [f"2026-06-20 10:02:{i:02d} INFO retrying job {i}" for i in range(n_noise - half)]
+    return "\n".join(lines)
+
+
+def test_log_applies_on_noisy_log():
+    # 噪音佔比高、可分類行多 → log 策略認領。
+    assert LOG.applies(_noisy_log()) is True
+
+
+def test_log_applies_false_on_prose():
+    prose = "\n".join(f"This is sentence number {i} about nothing in particular." for i in range(30))
+    assert LOG.applies(prose) is False
+
+
+def test_log_applies_false_when_no_noise():
+    # 全 ERROR：沒噪音可丟 → 不認領，交給 truncate 兜底。
+    all_err = "\n".join(f"ERROR something broke {i}" for i in range(30))
+    assert LOG.applies(all_err) is False
+
+
+def test_log_squeeze_drops_noise_keeps_errors():
+    out = _log_squeeze(_noisy_log())
+    assert "DEBUG" not in out
+    assert "INFO" not in out
+    assert out.count("ERROR") == 5  # 高嚴重度全留
+
+
+def test_log_keeps_middle_errors_unlike_truncate():
+    # 3 個 error 埋在 60 行噪音中段；truncate 頭尾保留會丟掉它們，log 全留。
+    log = _noisy_log(n_errors=3, n_noise=60)
+    out = squeeze_text(log)
+    assert out.count("ERROR") == 3
+    assert "dropped" in out  # 走的是 log 策略，不是 truncate 的 "squeezed"
+
+
+def test_log_marker_has_count_and_key():
+    log = _noisy_log()
+    out = squeeze_text(log)
+    assert f"sha256:{content_key(log)}" in out
+    assert "dropped 20 log lines" in out
+
+
+def test_log_deterministic():
+    log = _noisy_log()
+    assert squeeze_text(log) == squeeze_text(log)
+
+
+def test_log_stores_original_before_squeezing():
+    store = _SpyStore()
+    log = _noisy_log()
+    squeeze_text(log, store=store)
+    assert store.puts == [log]  # 產出有損輸出前收存原文一次
+
+
+def test_log_no_drop_returns_text_without_put():
+    # 防禦性：squeeze 直呼但無噪音可丟 → 原文回、絕不 put（守神聖收存時機）。
+    store = _SpyStore()
+    all_err = "\n".join(f"ERROR x {i}" for i in range(10))
+    assert _log_squeeze(all_err, store) == all_err
+    assert store.puts == []
+
+
+def test_log_registered_before_truncate():
+    names = [s.name for s in STRATEGIES]
+    assert names.index("log") < names.index("truncate")
+
+
+def test_word_boundary_information_not_info():
+    # 整詞比對：INFORMATION 不該被當成 INFO。
+    assert _severity("2026 INFORMATION about the system") == "other"
+    assert _severity("2026 INFO about the system") == "drop"
+    assert _severity("2026 WARNING disk almost full") == "keep"

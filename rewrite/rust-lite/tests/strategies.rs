@@ -9,7 +9,7 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, HEAD_LINES, TAIL_LINES, TRUNCATE,
+    squeeze_text, squeeze_text_with, Strategy, HEAD_LINES, LOG, STRATEGIES, TAIL_LINES, TRUNCATE,
 };
 
 fn long_text() -> String {
@@ -124,4 +124,87 @@ fn unicode_text_deterministic_and_keyed() {
     let b = squeeze_text(&text).expect("unicode 長文該壓");
     assert_eq!(a, b, "unicode 輸入必須確定性");
     assert!(a.contains(&format!("sha256:{}", content_key(&text))));
+}
+
+// ── M12：log 內容感知策略（對齊 Python test_strategies.py）──
+
+/// 噪音夾雜的 log：error 刻意埋在「中段」（truncate 的盲區）。
+fn noisy_log_n(n_errors: usize, n_noise: usize) -> String {
+    let half = n_noise / 2;
+    let mut lines: Vec<String> = (0..half)
+        .map(|i| format!("2026-06-20 10:00:{i:02} DEBUG worker tick {i}"))
+        .collect();
+    lines.extend((0..n_errors).map(|i| format!("2026-06-20 10:01:{i:02} ERROR db connection failed attempt {i}")));
+    lines.extend((0..n_noise - half).map(|i| format!("2026-06-20 10:02:{i:02} INFO retrying job {i}")));
+    lines.join("\n")
+}
+fn noisy_log() -> String {
+    noisy_log_n(5, 20)
+}
+
+#[test]
+fn log_applies_on_noisy_log() {
+    assert!((LOG.applies)(&noisy_log()));
+}
+
+#[test]
+fn log_applies_false_on_prose() {
+    let prose = (0..30)
+        .map(|i| format!("This is sentence number {i} about nothing in particular."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(LOG.applies)(&prose));
+}
+
+#[test]
+fn log_applies_false_when_no_noise() {
+    // 全 ERROR：沒噪音可丟 → 不認領，交給 truncate 兜底。
+    let all_err = (0..30).map(|i| format!("ERROR something broke {i}")).collect::<Vec<_>>().join("\n");
+    assert!(!(LOG.applies)(&all_err));
+}
+
+#[test]
+fn log_squeeze_drops_noise_keeps_errors() {
+    let out = (LOG.squeeze)(&noisy_log()).expect("noisy log 該壓");
+    assert!(!out.contains("DEBUG"));
+    assert!(!out.contains("INFO"));
+    assert_eq!(out.matches("ERROR").count(), 5);
+}
+
+#[test]
+fn log_keeps_middle_errors_unlike_truncate() {
+    // 3 個 error 埋在 60 行噪音中段；truncate 頭尾保留會丟掉，log 全留。
+    let log = noisy_log_n(3, 60);
+    let out = squeeze_text(&log).expect("noisy log 該壓");
+    assert_eq!(out.matches("ERROR").count(), 3);
+    assert!(out.contains("dropped")); // 走 log 策略，不是 truncate 的 "squeezed"
+}
+
+#[test]
+fn log_marker_has_count_and_key() {
+    let log = noisy_log();
+    let out = squeeze_text(&log).expect("noisy log 該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&log))));
+    assert!(out.contains("dropped 20 log lines"));
+}
+
+#[test]
+fn log_no_drop_returns_none() {
+    // 防禦性：squeeze 直呼但無噪音可丟 → None（呼叫端保留原文、不 put）。
+    let all_err = (0..10).map(|i| format!("ERROR x {i}")).collect::<Vec<_>>().join("\n");
+    assert_eq!((LOG.squeeze)(&all_err), None);
+}
+
+#[test]
+fn log_registered_before_truncate() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let log_i = names.iter().position(|&n| n == "log").expect("log 已註冊");
+    let trunc_i = names.iter().position(|&n| n == "truncate").expect("truncate 已註冊");
+    assert!(log_i < trunc_i, "log 必須排在 truncate 之前");
+}
+
+#[test]
+fn log_deterministic() {
+    let log = noisy_log();
+    assert_eq!(squeeze_text(&log), squeeze_text(&log));
 }

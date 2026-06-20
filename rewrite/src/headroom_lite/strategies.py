@@ -73,8 +73,102 @@ def _truncate_squeeze(text: str, store=None) -> str:
 # truncate 是永遠適用的 catch-all，必須殿後（內容感知策略排它前面）。
 TRUNCATE = Strategy("truncate", _truncate_applies, _truncate_squeeze)
 
-# 策略註冊表：按優先序排列。骨架階段只有 truncate；接內容感知策略時插在它前面。
-STRATEGIES: tuple[Strategy, ...] = (TRUNCATE,)
+
+# ── M12 — log 內容感知策略（第一片真正的「嗅探→壓」內容策略）──
+#
+# 與盲目頭尾截斷的差別：log 行可逐行依「嚴重度」分類。把噪音（TRACE/DEBUG/INFO）
+# 丟掉、保留所有高嚴重度（WARN/ERROR/...）與其他行。為何更好？散落在「中段」的
+# ERROR —— truncate 只留頭尾、會把它們連同中段一起丟掉；log 策略逐行嗅探，每個
+# error 都留下。代價是位元壓縮率可能不如截斷，但保住的是訊號（內容感知的取捨：
+# 寧可多留 error，也不盲砍）。噪音佔比不夠高就不認領，讓 truncate 兜底。
+
+MIN_LOG_LINES = 6  # 太少行不值得當 log 處理
+LOG_RATIO = 0.6  # 可分類行（含 level token）佔非空行比例下限
+NOISE_RATIO = 0.3  # 可丟噪音行佔比下限 —— 低於此交給 truncate（避免吃掉全高嚴重度 log）
+
+# 嚴重度 token：ASCII 大寫、以「整詞」比對（前後皆非 ASCII 英數）。
+# WARNING 排在 WARN 前無妨：兩者都歸 keep，整詞比對也不會把 WARN 誤配進 WARNING。
+_KEEP_TOKENS = (b"WARNING", b"WARN", b"ERROR", b"FATAL", b"CRITICAL")
+_DROP_TOKENS = (b"TRACE", b"DEBUG", b"INFO")
+
+
+def _is_ascii_alnum(b: int) -> bool:
+    """ASCII 英數判斷 —— 刻意只認 ASCII，與 Rust `is_ascii_alphanumeric` 逐字節對齊
+    （Python `str.isalnum()` 認 Unicode，會讓中文等被當英數而與 Rust 分岔）。"""
+    return 0x30 <= b <= 0x39 or 0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A
+
+
+def _contains_word(line: bytes, token: bytes) -> bool:
+    """token 是否以「整詞」出現在 line（前後皆字串邊界或非 ASCII 英數）。
+
+    對 bytes 操作（非 str），與 Rust 端同走 byte 視角 —— 多位元組 UTF-8 字元的
+    每個 byte 都 >127，兩語言一致視為詞邊界。
+    """
+    n = len(token)
+    start = 0
+    while True:
+        i = line.find(token, start)
+        if i == -1:
+            return False
+        before_ok = i == 0 or not _is_ascii_alnum(line[i - 1])
+        after_ok = i + n == len(line) or not _is_ascii_alnum(line[i + n])
+        if before_ok and after_ok:
+            return True
+        start = i + 1
+
+
+def _severity(line: str) -> str:
+    """分類一行：'keep'（高嚴重度，保留）/ 'drop'（噪音，可丟）/ 'other'（無 token，保留）。"""
+    lb = line.encode("utf-8")
+    if any(_contains_word(lb, t) for t in _KEEP_TOKENS):
+        return "keep"
+    if any(_contains_word(lb, t) for t in _DROP_TOKENS):
+        return "drop"
+    return "other"
+
+
+def _log_applies(text: str) -> bool:
+    """嗅探：夠多行像 log、且噪音佔比夠高（值得丟）才認領；否則讓 truncate 兜底。"""
+    nonempty = [line for line in text.split("\n") if line.strip()]
+    total = len(nonempty)
+    if total < MIN_LOG_LINES:
+        return False
+    drop = classified = 0
+    for line in nonempty:
+        sev = _severity(line)
+        if sev != "other":
+            classified += 1
+        if sev == "drop":
+            drop += 1
+    if drop == 0:
+        return False
+    return classified / total >= LOG_RATIO and drop / total >= NOISE_RATIO
+
+
+def _log_squeeze(text: str, store=None) -> str:
+    """丟掉噪音行（TRACE/DEBUG/INFO），保留高嚴重度與其他行，末尾附一行標記。
+
+    標記內含「丟掉行數 + 原文 content_key」—— key 是 CCR store 的取回鑰匙，也是
+    確定性證明書（同原文永遠同標記）。沒噪音可丟 → 原文回、絕不 put（神聖時機契約）。
+    """
+    lines = text.split("\n")
+    severities = [_severity(line) for line in lines]
+    dropped = sum(1 for s in severities if s == "drop")
+    if dropped == 0:
+        return text  # 沒得丟 → 原文回，不 put
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    digest = content_key(text)
+    kept = [line for line, sev in zip(lines, severities) if sev != "drop"]
+    marker = f"[... headroom-lite dropped {dropped} log lines | sha256:{digest} ...]"
+    return "\n".join([*kept, marker])
+
+
+# log 是內容感知策略，排在 truncate catch-all 之前。
+LOG = Strategy("log", _log_applies, _log_squeeze)
+
+# 策略註冊表：按優先序排列。log 先嗅探，不命中才落到 truncate 兜底。
+STRATEGIES: tuple[Strategy, ...] = (LOG, TRUNCATE)
 
 
 def squeeze_text(text: str, store=None, strategies: tuple[Strategy, ...] = STRATEGIES) -> str:

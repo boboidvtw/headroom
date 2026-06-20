@@ -91,12 +91,14 @@ fn non_json_body_passes_through() {
 #[test]
 fn marker_format_matches_python_version() {
     // 跨語言 parity 的前提：標記格式逐字相同（Phase I 之魂）。
+    // huge_log 是純 INFO log → M12 起走 log 策略（"dropped"），逐字節 parity 由
+    // scripts/parity.sh 把關；這裡只鎖標記格式骨架。
     let raw = conversation(&huge_log());
     let out = compress_request(&raw);
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     let squeezed = parsed["messages"][4]["content"][0]["content"].as_str().unwrap();
     assert!(
-        squeezed.contains("[... headroom-lite squeezed ") && squeezed.contains(" lines | sha256:"),
+        squeezed.contains("[... headroom-lite dropped ") && squeezed.contains(" log lines | sha256:"),
         "標記格式與 Python 版不一致"
     );
 }
