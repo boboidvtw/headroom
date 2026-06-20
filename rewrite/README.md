@@ -40,6 +40,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M9 | `fd2e135` | CCR retrieve wired into the proxy — side-channel endpoint + server-side resolve loop | `POST /ccr/retrieve` exposes the store (200/404); the resolve loop intercepts the model's `ccr_retrieve` tool_use, serves the original from the store, and re-calls upstream until a real answer — the client never sees the injected tool; only fires on POST `/v1/messages` JSON responses, leaves SSE & plain JSON byte-faithful, capped at 8 hops; only intercepts when *every* tool_use is ccr_retrieve (foreign tools pass through untouched) |
 | M10 | `d5c7220` | SSE streaming `ccr_retrieve` **observe-only** probe | deep-read of the answer key (`sse/anthropic.rs` + proxy `PR-C1`) revealed the industrial choice: streaming byte-passthrough is sacred, the SSE state machine is a passive telemetry tee (`mpsc` + spawned task, never blocks the client), retrieval honoring is **not** done in-stream. Faithful to that: `SseCcrProbe` detects a streamed `ccr_retrieve` call (track tool_use by `index`, accumulate `input_json_delta`, parse at `content_block_stop`) and logs an observability line — **zero bytes touched**. In-stream closure belongs to another layer; the non-stream path already closes the loop (M9) |
 | M11 | `4e10def` | pluggable content-sniffing compression strategy dispatcher (skeleton) | pure refactor of live-zone — `Strategy = (applies, squeeze)`, `TRUNCATE` as catch-all; adding log/search/diff later = one strategy + register; `store.put` timing stays inside the strategy (sacred spec); Py/Rs store-side asymmetry but markers byte-identical ⇒ parity holds; proven byte-identical vs pre-refactor across 92 inputs + cross-language differential + adversarial fuzz |
+| M12 | `4020ee2` | first real content-aware strategy: **log compression** | classify lines by severity, drop noise (`TRACE/DEBUG/INFO`), keep signal (`WARN/ERROR/FATAL/CRITICAL`) + others; marker = `dropped N log lines` + `content_key`. Beats blind head/tail truncation on the thing that matters: ERRORs buried in the **middle** — truncate keeps only head+tail and loses them, log sniffs every line and keeps each one (content-aware trade: keep errors over raw byte ratio). Claims only when noise ≥ 30% (else falls through to truncate, so all-error logs aren't swallowed). Whole-word match (`INFORMATION ≠ INFO`), byte-level ASCII boundaries, Py/Rs byte-identical. Existing `01_messy_full` (a real log) auto-routes to log: 14473→**1147** (truncate was 2524) — smaller *and* signal-preserving; new `06_noisy_log` fixture locks the keep-middle-errors branch |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -90,16 +91,44 @@ CCR store 一致）、**跨語言 differential**（Python vs Rust `compress_stdi
 （`git log`、`parity.sh` 的 exit code）與編譯器，絕不信包裝過的查詢。M11 的程式碼能
 落地，是因為用自包含腳本在乾淨 terminal 重建，再從零核實。
 
+## Notes — M12 (2026-06-20)
+
+M12 grew the **first real content-aware strategy** onto the M11 dispatcher: log
+compression. Instead of blind head/tail truncation, it classifies each line by
+severity, drops the noise (`TRACE/DEBUG/INFO`) and keeps every signal line
+(`WARN/ERROR/FATAL/CRITICAL`) plus anything unclassified, ending with a
+`dropped N log lines | sha256:…` marker. The teaching point is the trade-off, not
+the byte count: an ERROR buried in the **middle** of a noisy log survives here but
+would be truncated away by head/tail. To avoid swallowing all-error logs, the
+strategy only claims input when noise is ≥ 30% of the lines — otherwise it falls
+through to `truncate`. Word matching is whole-word and byte-level ASCII
+(`INFORMATION ≠ INFO`) so Python and Rust classify identically. The pre-existing
+`01_messy_full` fixture turned out to be a real log and now routes through this
+strategy (14473→1147, vs 2524 under truncate); `06_noisy_log` was added to lock
+the keep-middle-errors branch in the parity gate.
+
+## Notes — M12（2026-06-20）
+
+M12 在 M11 dispatcher 上長出**第一片真正的內容感知策略**：log 壓縮。不再盲目頭尾
+截斷，而是逐行依嚴重度分類，丟噪音（`TRACE/DEBUG/INFO`）、保所有訊號行
+（`WARN/ERROR/FATAL/CRITICAL`）與其他行，末尾附 `dropped N log lines | sha256:…`
+標記。教學重點是取捨而非位元數：埋在噪音**中段**的 ERROR 在這裡會存活，頭尾截斷則
+會把它連同中段一起丟掉。為免吃掉全是 error 的 log，策略只在噪音佔比 ≥ 30% 時才認領，
+否則落到 `truncate` 兜底。整詞、byte 級 ASCII 邊界比對（`INFORMATION ≠ INFO`），讓
+Python 與 Rust 分類逐字節一致。既有 `01_messy_full` fixture 原來是一份真 log，現在改
+走此策略（14473→1147，truncate 時是 2524）；新增 `06_noisy_log` 把「保留中段
+error」分支鎖進 parity gate。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 48 tests
+cd rewrite && uv run pytest -q              # 59 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 62 tests
+cd rewrite/rust-lite && cargo test          # 72 tests
 
-# Cross-language parity gate / 跨語言 parity gate（5 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（6 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
