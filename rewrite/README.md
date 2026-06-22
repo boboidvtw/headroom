@@ -43,6 +43,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M12 | `4020ee2` | first real content-aware strategy: **log compression** | classify lines by severity, drop noise (`TRACE/DEBUG/INFO`), keep signal (`WARN/ERROR/FATAL/CRITICAL`) + others; marker = `dropped N log lines` + `content_key`. Beats blind head/tail truncation on the thing that matters: ERRORs buried in the **middle** — truncate keeps only head+tail and loses them, log sniffs every line and keeps each one (content-aware trade: keep errors over raw byte ratio). Claims only when noise ≥ 30% (else falls through to truncate, so all-error logs aren't swallowed). Whole-word match (`INFORMATION ≠ INFO`), byte-level ASCII boundaries, Py/Rs byte-identical. Existing `01_messy_full` (a real log) auto-routes to log: 14473→**1147** (truncate was 2524) — smaller *and* signal-preserving; new `06_noisy_log` fixture locks the keep-middle-errors branch |
 | M13 | _local_ | second content-aware strategy: **diff compression** | classify unified/git-diff lines by role, drop unchanged context (` ` space-prefixed), keep every structural line: hunk headers (`@@`), file headers (`diff`/`index`/`---`/`+++`), and all `+`/`-` changes; marker = `dropped N diff context lines` + `content_key`. Same win as log on buried signal: changes scattered in a large context block — truncate keeps only head+tail and loses the middle ones, diff sniffs every line and keeps each change (hunk headers already encode line ranges; CCR store holds the original for reversal). Claims only with a hunk header present (so markdown `+`/`-` bullets aren't mistaken for a diff) and context ≥ 30% (else falls through to truncate). Registered **before** log — a `@@`-bearing diff's structure outranks log severity classification (existing logs have no hunk header, so they don't collide). Pure ASCII byte prefixes (no `strip`/`trim` unicode divergence), Py/Rs byte-identical. New `07_diff.json` fixture: 7227→**1857** bytes through the full pipeline, cross-language byte-for-byte |
 | M14 | _local_ | third content-aware strategy: **search compression** | grep/rg `file:lineno:content` output — cap matches per file (keep first 3, drop the rest), marker = `dropped N search result lines` + `content_key`. The teaching landmine: detecting a match line by "`:`-split, second field all digits" also matches log timestamps (`10:30:45` is literally `field:digits:field`) — so search would cannibalize logs. Fix: require the file_key (before the first `:`) to contain a `/`; real `grep -rn pat .` always carries a path (`./src/foo.py:12:`), a timestamp prefix (`2026-06-20T10`) never does — a pure ASCII byte check, identical across languages. Registered `(DIFF, SEARCH, LOG, TRUNCATE)`: grep-over-logs routes to search, but existing logs have no `/`-bearing `file:line:` lines so they still route to log (no M12 regression). Determinism via in-order scan + per-file counts (HashMap looked up, never iterated → no hash-order dependence). New `08_search.json` fixture: 4289→**1702** bytes, byte-for-byte |
+| M15 | _local_ | fourth content-aware strategy: **json compression** | find the largest JSON array, keep first 5 + last 2 elements, splice a marker string element in between (result stays valid JSON), copy everything outside the array verbatim; marker = `dropped N array elements` + `content_key`. The headline lesson is the parity insight: the obvious approach — parse, truncate, re-serialize — hits the number-reserialization landmine (`json.dumps` normalizes `1.10`→`1.1`, but Rust's `arbitrary_precision` keeps `1.10` → divergence). The fix is to **never re-serialize any value**: a byte-level structural scan (tracking string literals and nesting depth) records element byte-spans, and kept elements are copied as raw byte slices — only the structural chars (`[` `,` `]`) and the marker are newly written, all ASCII constants. So Python and Rust can't diverge on values. Determinism: tie-break is most-elements-then-smallest-start (Python `max` keeps first on ties, Rust `max_by_key` keeps last, so both use explicit "strictly-greater replaces"). Guarded to genuine JSON documents (first non-whitespace byte is `[`/`{`) so bracket-containing prose/logs aren't mistaken for JSON. Registered first. New `09_json.json` fixture deliberately includes `1.10` and `1e10`: 2959→**1651** bytes, byte-for-byte across languages with the tricky numbers preserved verbatim |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -189,16 +190,55 @@ M14 接上**第三片內容感知策略**：search 壓縮，對象是 grep/rg �
 保序逐行掃 + per-file 計數的 map——只查找、從不迭代，故無雜湊順序依賴。新增
 `08_search.json` 走完整 pipeline 壓 4289→1702 bytes，逐字節一致。
 
+## Notes — M15 (2026-06-22)
+
+M15 added the **fourth content-aware strategy**: json compression. It finds the
+largest JSON array, keeps its first 5 and last 2 elements, splices a marker string
+element in between (so the result is still valid JSON), and copies everything outside
+that array verbatim. The headline is a parity lesson. The obvious implementation —
+parse the JSON, truncate the array, re-serialize — walks straight into the number
+landmine flagged earlier: Python's `json.dumps` normalizes `1.10` to `1.1`, while
+Rust's `serde_json` with `arbitrary_precision` keeps `1.10`, so the two byte streams
+diverge. The fix is to **never re-serialize a value**. A byte-level structural scan
+(tracking string literals so brackets/commas inside strings don't count, and nesting
+depth so commas only split the innermost array) records each element's byte span;
+kept elements are copied as raw slices. The only newly-written bytes are the
+structural `[`, `,`, `]` and the marker — all ASCII constants — so Python and Rust
+cannot disagree on a value. Tie-breaking is explicit (most elements, then smallest
+start offset) because Python `max` keeps the first equal element while Rust
+`max_by_key` keeps the last. The strategy only claims genuine JSON documents (first
+non-whitespace byte is `[` or `{`), so prose or logs that merely contain brackets are
+left alone, and it registers first. The new `09_json.json` fixture deliberately mixes
+`1.10` and `1e10` into the array: it compresses 2959→1651 bytes, byte-for-byte across
+both languages, with those numbers preserved verbatim — the proof that the
+copy-don't-reserialize approach defuses the landmine.
+
+## Notes — M15（2026-06-22）
+
+M15 接上**第四片內容感知策略**：json 壓縮。它找出元素最多的 JSON array，保留前 5 +
+後 2 個元素、中間塞一個 marker 字串元素（結果仍是合法 JSON），array 以外的 bytes
+全部照抄。重點是一個 parity 教訓。最直覺的做法——parse、截斷、重新序列化——會正面
+撞上先前點出的數字地雷：Python 的 `json.dumps` 把 `1.10` 正規化成 `1.1`，而 Rust 的
+`serde_json`（開 `arbitrary_precision`）保留 `1.10`，兩邊 byte 流就分岔了。解法是
+**絕不重序列化任何值**：用 byte-level 結構掃描（追蹤字串字面值，讓字串內的括號/逗號
+不算數；追蹤巢狀深度，讓逗號只切最內層 array）記錄每個元素的 byte span，被保留的元素
+照抄原始切片。唯一新寫入的 bytes 是結構字元 `[` `,` `]` 與 marker——全是 ASCII 常數——
+所以 Python 與 Rust 不可能在值上分岔。tie-break 顯式寫死（元素最多，同票取 start 最小），
+因為 Python `max` 同票保第一個、Rust `max_by_key` 保最後一個。策略只認領真正的 JSON
+文件（首個非空白 byte 是 `[`/`{`），含括號的 prose/log 不碰；且註冊在最前。新增的
+`09_json.json` fixture 刻意把 `1.10` 與 `1e10` 混進 array：壓 2959→1651 bytes、兩語言
+逐字節一致、那些數字原樣保留——正是「照抄而不重序列化」拆掉地雷的證明。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 81 tests
+cd rewrite && uv run pytest -q              # 94 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 90 tests
+cd rewrite/rust-lite && cargo test          # 101 tests
 
-# Cross-language parity gate / 跨語言 parity gate（8 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（9 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
