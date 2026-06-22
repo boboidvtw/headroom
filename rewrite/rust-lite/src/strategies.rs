@@ -183,8 +183,71 @@ pub const LOG: Strategy = Strategy {
     squeeze: log_squeeze,
 };
 
-/// 策略註冊表：按優先序排列。log 先嗅探，不命中才落到 truncate 兜底。
-pub const STRATEGIES: &[Strategy] = &[LOG, TRUNCATE];
+// ── M13 — diff 內容感知策略（Rust port，對齊 Python `strategies.py`）──
+//
+// 與盲目頭尾截斷的差別：unified/git diff 可逐行依「角色」分類。把未變更的
+// context 行（` ` 空格開頭）丟掉、保留所有結構行：hunk header（`@@`）、檔頭
+// （`diff`/`index`/`---`/`+++`）、與所有 `+`/`-` 變更行。散落在大段 context 中的
+// 零星變更 —— truncate 只留頭尾會連同 context 一起丟；diff 策略逐行嗅探把每個變更
+// 與 hunk header 都留下（hunk header 已編碼行號範圍可定位、CCR store 保有原文可逆）。
+// context 佔比不夠高就不認領、讓 truncate 兜底。標記格式與 Python 版逐字相同 → parity。
+//
+// 與 log 對稱、刻意全用 ASCII byte 前綴比對（`starts_with(" ")` / `starts_with("@@")`），
+// 不走 trim —— 避開 Python `strip()` 認 unicode 空白、與 Rust `trim` 分岔的地雷。
+//
+// 收存點不對稱（誠實記錄，承襲 M11/M12）：Rust squeeze 純函式（吃 &str、不碰 store），
+// store.put 在 live_zone::compress_block 呼叫端（result.is_some() 時）；Python 把 put
+// 放策略內。兩邊在「同一條件下決定產出有損輸出」→ put 時機等價、parity 不破。
+
+const MIN_DIFF_LINES: usize = 6;
+const DIFF_CONTEXT_RATIO: f64 = 0.3; // 可丟 context 行佔比下限 —— 低於此交給 truncate
+
+/// 嗅探：像 unified diff（有 hunk header）、且 context 佔比夠高才認領；否則讓 truncate 兜底。
+fn diff_applies(text: &str) -> bool {
+    let lines: Vec<&str> = text.split('\n').collect();
+    // hunk header（`@@ -a,b +c,d @@`）是 diff 的獨有信號 —— 沒有就不是 diff，避免誤判
+    // markdown 的 `+`/`-` 條列。
+    if !lines.iter().any(|l| l.starts_with("@@")) {
+        return false;
+    }
+    let total = lines.len();
+    if total < MIN_DIFF_LINES {
+        return false;
+    }
+    let context = lines.iter().filter(|l| l.starts_with(' ')).count();
+    if context == 0 {
+        return false;
+    }
+    (context as f64 / total as f64) >= DIFF_CONTEXT_RATIO
+}
+
+/// 丟掉 context 行（` ` 空格開頭），保留 hunk header / 檔頭 / 所有 +/- 變更行，末尾附標記。
+/// 沒 context 可丟回 `None`（呼叫端保留原文、不 put）。
+fn diff_squeeze(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let dropped = lines.iter().filter(|l| l.starts_with(' ')).count();
+    if dropped == 0 {
+        return None;
+    }
+    let marker = format!(
+        "[... headroom-lite dropped {dropped} diff context lines | sha256:{} ...]",
+        content_key(text)
+    );
+    let mut parts: Vec<&str> = lines.iter().filter(|l| !l.starts_with(' ')).copied().collect();
+    parts.push(&marker);
+    Some(parts.join("\n"))
+}
+
+/// diff 是內容感知策略，排在 truncate catch-all 之前；亦排在 log 之前 —— 帶 `@@` 的
+/// diff 結構比 log 嚴重度分類更該優先保留（既有 log 內容無 hunk header，互不干擾）。
+pub const DIFF: Strategy = Strategy {
+    name: "diff",
+    applies: diff_applies,
+    squeeze: diff_squeeze,
+};
+
+/// 策略註冊表：按優先序排列。diff/log 先嗅探，不命中才落到 truncate 兜底。
+pub const STRATEGIES: &[Strategy] = &[DIFF, LOG, TRUNCATE];
 
 /// dispatcher：選第一個 applies 命中的策略來壓，命中即停。預設用模組級註冊表。
 pub fn squeeze_text(text: &str) -> Option<String> {

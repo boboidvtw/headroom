@@ -167,8 +167,64 @@ def _log_squeeze(text: str, store=None) -> str:
 # log 是內容感知策略，排在 truncate catch-all 之前。
 LOG = Strategy("log", _log_applies, _log_squeeze)
 
-# 策略註冊表：按優先序排列。log 先嗅探，不命中才落到 truncate 兜底。
-STRATEGIES: tuple[Strategy, ...] = (LOG, TRUNCATE)
+
+# ── M13 — diff 內容感知策略（第二片「嗅探→壓」內容策略）──
+#
+# 與盲目頭尾截斷的差別：unified/git diff 可逐行依「角色」分類。把未變更的
+# context 行（` ` 空格開頭）丟掉、保留所有結構行：hunk header（`@@`）、檔頭
+# （`diff`/`index`/`---`/`+++`）、與所有 `+`/`-` 變更行。為何更好？散落在大段
+# context 中的零星變更 —— truncate 只留頭尾、會把中段的變更連同 context 一起丟；
+# diff 策略逐行嗅探，每個變更與 hunk header 都留下（hunk header 已編碼行號範圍，
+# 足以定位；CCR store 保有完整原文可逆取回）。噪音（context）佔比不夠高就不認領，
+# 讓 truncate 兜底。標記格式與 Rust 版逐字相同 → parity。
+#
+# 與 log 對稱、刻意全用 ASCII byte 前綴比對（`startswith(" ")` / `startswith("@@")`），
+# 不走 `str.strip()` —— 避開 Python `strip()` 認 unicode 空白、與 Rust `trim` 分岔的地雷。
+
+MIN_DIFF_LINES = 6  # 太少行不值得當 diff 處理
+DIFF_CONTEXT_RATIO = 0.3  # 可丟 context 行佔比下限 —— 低於此交給 truncate
+
+
+def _diff_applies(text: str) -> bool:
+    """嗅探：像 unified diff（有 hunk header）、且 context 佔比夠高才認領；否則讓 truncate 兜底。"""
+    lines = text.split("\n")
+    # hunk header（`@@ -a,b +c,d @@`）是 diff 的獨有信號 —— 沒有就不是 diff，避免誤判
+    # markdown 的 `+`/`-` 條列。
+    if not any(line.startswith("@@") for line in lines):
+        return False
+    total = len(lines)
+    if total < MIN_DIFF_LINES:
+        return False
+    context = sum(1 for line in lines if line.startswith(" "))
+    if context == 0:
+        return False
+    return context / total >= DIFF_CONTEXT_RATIO
+
+
+def _diff_squeeze(text: str, store=None) -> str:
+    """丟掉 context 行（` ` 空格開頭），保留 hunk header / 檔頭 / 所有 +/- 變更行，末尾附標記。
+
+    標記內含「丟掉行數 + 原文 content_key」—— key 是 CCR store 的取回鑰匙，也是
+    確定性證明書（同原文永遠同標記）。沒 context 可丟 → 原文回、絕不 put（神聖時機契約）。
+    """
+    lines = text.split("\n")
+    dropped = sum(1 for line in lines if line.startswith(" "))
+    if dropped == 0:
+        return text  # 沒得丟 → 原文回，不 put
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    digest = content_key(text)
+    kept = [line for line in lines if not line.startswith(" ")]
+    marker = f"[... headroom-lite dropped {dropped} diff context lines | sha256:{digest} ...]"
+    return "\n".join([*kept, marker])
+
+
+# diff 是內容感知策略，排在 truncate catch-all 之前；亦排在 log 之前 —— 帶 `@@` 的
+# diff 結構比 log 嚴重度分類更該優先保留（既有 log 內容無 hunk header，互不干擾）。
+DIFF = Strategy("diff", _diff_applies, _diff_squeeze)
+
+# 策略註冊表：按優先序排列。diff/log 先嗅探，不命中才落到 truncate 兜底。
+STRATEGIES: tuple[Strategy, ...] = (DIFF, LOG, TRUNCATE)
 
 
 def squeeze_text(text: str, store=None, strategies: tuple[Strategy, ...] = STRATEGIES) -> str:

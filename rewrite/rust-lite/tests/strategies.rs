@@ -9,7 +9,8 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, HEAD_LINES, LOG, STRATEGIES, TAIL_LINES, TRUNCATE,
+    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, LOG, STRATEGIES, TAIL_LINES,
+    TRUNCATE,
 };
 
 fn long_text() -> String {
@@ -207,4 +208,100 @@ fn log_registered_before_truncate() {
 fn log_deterministic() {
     let log = noisy_log();
     assert_eq!(squeeze_text(&log), squeeze_text(&log));
+}
+
+// ── M13：diff 內容感知策略（對齊 Python test_strategies.py）──
+
+/// context 夾雜的 unified diff：變更刻意埋在「中段」（truncate 的盲區）。
+fn diff_n(n_context: usize, n_changes: usize) -> String {
+    let half = n_context / 2;
+    let mut lines: Vec<String> = vec![
+        "diff --git a/app.py b/app.py".into(),
+        "index 1111111..2222222 100644".into(),
+        "--- a/app.py".into(),
+        "+++ b/app.py".into(),
+        "@@ -1,40 +1,40 @@ def main():".into(),
+    ];
+    lines.extend((0..half).map(|i| format!(" context line {i} unchanged")));
+    lines.extend((0..n_changes).map(|i| format!("-old line {i}")));
+    lines.extend((0..n_changes).map(|i| format!("+new line {i}")));
+    lines.extend((half..n_context).map(|i| format!(" context line {i} unchanged")));
+    lines.join("\n")
+}
+fn diff() -> String {
+    diff_n(20, 4)
+}
+
+#[test]
+fn diff_applies_on_unified_diff() {
+    assert!((DIFF.applies)(&diff()));
+}
+
+#[test]
+fn diff_applies_false_without_hunk_header() {
+    // 像 diff 的 +/- 但沒 hunk header（如 markdown 條列）→ 不認領。
+    let no_hunk = (0..30)
+        .map(|i| if i % 2 == 1 { format!("- bullet {i}") } else { format!("+ bullet {i}") })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(DIFF.applies)(&no_hunk));
+}
+
+#[test]
+fn diff_applies_false_when_no_context() {
+    // 全變更行、無 context 可丟 → 不認領，交給後手兜底。
+    let all_changes =
+        format!("@@ -1,5 +1,5 @@\n{}", (0..30).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n"));
+    assert!(!(DIFF.applies)(&all_changes));
+}
+
+#[test]
+fn diff_squeeze_drops_context_keeps_changes() {
+    let out = (DIFF.squeeze)(&diff()).expect("diff 該壓");
+    assert!(!out.contains("unchanged")); // 未變更的 context 全丟（標記文字含 "context" 故查內容字串）
+    assert_eq!(out.matches("-old line").count(), 4);
+    assert_eq!(out.matches("+new line").count(), 4);
+    assert!(out.contains("@@ -1,40 +1,40 @@"));
+    assert!(out.contains("diff --git a/app.py b/app.py"));
+}
+
+#[test]
+fn diff_keeps_middle_changes_unlike_truncate() {
+    // 變更埋在大段 context 中段；truncate 頭尾保留會丟掉，diff 全留。
+    let d = diff_n(60, 3);
+    let out = squeeze_text(&d).expect("diff 該壓");
+    assert_eq!(out.matches("-old line").count(), 3);
+    assert_eq!(out.matches("+new line").count(), 3);
+    assert!(out.contains("diff context lines")); // 走 diff 策略，不是 truncate 的 "squeezed"
+}
+
+#[test]
+fn diff_marker_has_count_and_key() {
+    let d = diff();
+    let out = squeeze_text(&d).expect("diff 該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&d))));
+    assert!(out.contains("dropped 20 diff context lines"));
+}
+
+#[test]
+fn diff_no_drop_returns_none() {
+    // 防禦性：squeeze 直呼但無 context 可丟 → None（呼叫端保留原文、不 put）。
+    let all_changes =
+        format!("@@ -1,5 +1,5 @@\n{}", (0..10).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n"));
+    assert_eq!((DIFF.squeeze)(&all_changes), None);
+}
+
+#[test]
+fn diff_registered_before_log_and_truncate() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let diff_i = names.iter().position(|&n| n == "diff").expect("diff 已註冊");
+    let log_i = names.iter().position(|&n| n == "log").expect("log 已註冊");
+    let trunc_i = names.iter().position(|&n| n == "truncate").expect("truncate 已註冊");
+    assert!(diff_i < log_i && log_i < trunc_i, "順序須為 diff < log < truncate");
+}
+
+#[test]
+fn diff_deterministic() {
+    let d = diff();
+    assert_eq!(squeeze_text(&d), squeeze_text(&d));
 }

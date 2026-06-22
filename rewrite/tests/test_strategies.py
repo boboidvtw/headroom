@@ -197,3 +197,86 @@ def test_word_boundary_information_not_info():
     assert _severity("2026 INFORMATION about the system") == "other"
     assert _severity("2026 INFO about the system") == "drop"
     assert _severity("2026 WARNING disk almost full") == "keep"
+
+
+# ── M13：diff 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import DIFF, _diff_squeeze
+
+
+def _diff(n_context: int = 20, n_changes: int = 4) -> str:
+    """一份 context 夾雜的 unified diff：變更刻意埋在「中段」（truncate 的盲區）。"""
+    half = n_context // 2
+    lines = ["diff --git a/app.py b/app.py", "index 1111111..2222222 100644",
+             "--- a/app.py", "+++ b/app.py", "@@ -1,40 +1,40 @@ def main():"]
+    lines += [f" context line {i} unchanged" for i in range(half)]
+    lines += [f"-old line {i}" for i in range(n_changes)]
+    lines += [f"+new line {i}" for i in range(n_changes)]
+    lines += [f" context line {i} unchanged" for i in range(half, n_context)]
+    return "\n".join(lines)
+
+
+def test_diff_applies_on_unified_diff():
+    # 有 hunk header、context 佔比高 → diff 策略認領。
+    assert DIFF.applies(_diff()) is True
+
+
+def test_diff_applies_false_without_hunk_header():
+    # 像 diff 的 +/- 但沒 hunk header（如 markdown 條列）→ 不認領。
+    no_hunk = "\n".join([f"- bullet {i}" if i % 2 else f"+ bullet {i}" for i in range(30)])
+    assert DIFF.applies(no_hunk) is False
+
+
+def test_diff_applies_false_when_no_context():
+    # 全變更行、無 context 可丟 → 不認領，交給後手兜底。
+    all_changes = "@@ -1,5 +1,5 @@\n" + "\n".join(f"+line {i}" for i in range(30))
+    assert DIFF.applies(all_changes) is False
+
+
+def test_diff_squeeze_drops_context_keeps_changes():
+    out = _diff_squeeze(_diff())
+    assert "unchanged" not in out  # 未變更的 context 全丟（標記文字含 "context" 故查內容字串）
+    assert out.count("-old line") == 4  # 所有移除行保留
+    assert out.count("+new line") == 4  # 所有新增行保留
+    assert "@@ -1,40 +1,40 @@" in out  # hunk header 保留
+    assert "diff --git a/app.py b/app.py" in out  # 檔頭保留
+
+
+def test_diff_keeps_middle_changes_unlike_truncate():
+    # 變更埋在大段 context 中段；truncate 頭尾保留會丟掉它們，diff 全留。
+    diff = _diff(n_context=60, n_changes=3)
+    out = squeeze_text(diff)
+    assert out.count("-old line") == 3
+    assert out.count("+new line") == 3
+    assert "diff context lines" in out  # 走 diff 策略，不是 truncate 的 "squeezed"
+
+
+def test_diff_marker_has_count_and_key():
+    diff = _diff()
+    out = squeeze_text(diff)
+    assert f"sha256:{content_key(diff)}" in out
+    assert "dropped 20 diff context lines" in out
+
+
+def test_diff_deterministic():
+    diff = _diff()
+    assert squeeze_text(diff) == squeeze_text(diff)
+
+
+def test_diff_stores_original_before_squeezing():
+    store = _SpyStore()
+    diff = _diff()
+    squeeze_text(diff, store=store)
+    assert store.puts == [diff]  # 產出有損輸出前收存原文一次
+
+
+def test_diff_no_drop_returns_text_without_put():
+    # 防禦性：squeeze 直呼但無 context 可丟 → 原文回、絕不 put（守神聖收存時機）。
+    store = _SpyStore()
+    all_changes = "@@ -1,5 +1,5 @@\n" + "\n".join(f"+line {i}" for i in range(10))
+    assert _diff_squeeze(all_changes, store) == all_changes
+    assert store.puts == []
+
+
+def test_diff_registered_before_log_and_truncate():
+    names = [s.name for s in STRATEGIES]
+    assert names.index("diff") < names.index("log") < names.index("truncate")
