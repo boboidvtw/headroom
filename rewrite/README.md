@@ -41,6 +41,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M10 | `d5c7220` | SSE streaming `ccr_retrieve` **observe-only** probe | deep-read of the answer key (`sse/anthropic.rs` + proxy `PR-C1`) revealed the industrial choice: streaming byte-passthrough is sacred, the SSE state machine is a passive telemetry tee (`mpsc` + spawned task, never blocks the client), retrieval honoring is **not** done in-stream. Faithful to that: `SseCcrProbe` detects a streamed `ccr_retrieve` call (track tool_use by `index`, accumulate `input_json_delta`, parse at `content_block_stop`) and logs an observability line — **zero bytes touched**. In-stream closure belongs to another layer; the non-stream path already closes the loop (M9) |
 | M11 | `4e10def` | pluggable content-sniffing compression strategy dispatcher (skeleton) | pure refactor of live-zone — `Strategy = (applies, squeeze)`, `TRUNCATE` as catch-all; adding log/search/diff later = one strategy + register; `store.put` timing stays inside the strategy (sacred spec); Py/Rs store-side asymmetry but markers byte-identical ⇒ parity holds; proven byte-identical vs pre-refactor across 92 inputs + cross-language differential + adversarial fuzz |
 | M12 | `4020ee2` | first real content-aware strategy: **log compression** | classify lines by severity, drop noise (`TRACE/DEBUG/INFO`), keep signal (`WARN/ERROR/FATAL/CRITICAL`) + others; marker = `dropped N log lines` + `content_key`. Beats blind head/tail truncation on the thing that matters: ERRORs buried in the **middle** — truncate keeps only head+tail and loses them, log sniffs every line and keeps each one (content-aware trade: keep errors over raw byte ratio). Claims only when noise ≥ 30% (else falls through to truncate, so all-error logs aren't swallowed). Whole-word match (`INFORMATION ≠ INFO`), byte-level ASCII boundaries, Py/Rs byte-identical. Existing `01_messy_full` (a real log) auto-routes to log: 14473→**1147** (truncate was 2524) — smaller *and* signal-preserving; new `06_noisy_log` fixture locks the keep-middle-errors branch |
+| M13 | _local_ | second content-aware strategy: **diff compression** | classify unified/git-diff lines by role, drop unchanged context (` ` space-prefixed), keep every structural line: hunk headers (`@@`), file headers (`diff`/`index`/`---`/`+++`), and all `+`/`-` changes; marker = `dropped N diff context lines` + `content_key`. Same win as log on buried signal: changes scattered in a large context block — truncate keeps only head+tail and loses the middle ones, diff sniffs every line and keeps each change (hunk headers already encode line ranges; CCR store holds the original for reversal). Claims only with a hunk header present (so markdown `+`/`-` bullets aren't mistaken for a diff) and context ≥ 30% (else falls through to truncate). Registered **before** log — a `@@`-bearing diff's structure outranks log severity classification (existing logs have no hunk header, so they don't collide). Pure ASCII byte prefixes (no `strip`/`trim` unicode divergence), Py/Rs byte-identical. New `07_diff.json` fixture: 7227→**1857** bytes through the full pipeline, cross-language byte-for-byte |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -119,16 +120,50 @@ Python 與 Rust 分類逐字節一致。既有 `01_messy_full` fixture 原來是
 走此策略（14473→1147，truncate 時是 2524）；新增 `06_noisy_log` 把「保留中段
 error」分支鎖進 parity gate。
 
+## Notes — M13 (2026-06-22)
+
+M13 added the **second content-aware strategy** to the dispatcher: diff compression.
+A unified/git diff classifies cleanly by line role — unchanged context lines start
+with a space and are pure noise; everything else is structure worth keeping. So the
+strategy drops the ` `-prefixed context and keeps every hunk header (`@@`), file
+header (`diff`/`index`/`---`/`+++`), and `+`/`-` change line, ending with a
+`dropped N diff context lines | sha256:…` marker. The win mirrors log: a change
+buried in a large context block survives here, but head/tail truncation would lose
+it — and the hunk header still carries the exact line ranges, with the CCR store
+holding the full original for reversal. Sniffing requires an actual `@@` hunk header
+(so markdown `+`/`-` bullet lists aren't mistaken for a diff) and ≥ 30% droppable
+context (else it falls through to `truncate`). It registers **before** log: a
+`@@`-bearing diff's structure should outrank log severity classification, and real
+logs carry no hunk header so the two never collide. As with log, the design sticks to
+pure ASCII byte prefixes (`starts_with(" ")` / `"@@"`) instead of `strip`/`trim` to
+dodge the Python-unicode-whitespace vs Rust divergence. New `07_diff.json` fixture
+runs the full pipeline 7227→1857 bytes, byte-for-byte across both languages.
+
+## Notes — M13（2026-06-22）
+
+M13 在 dispatcher 上接了**第二片內容感知策略**：diff 壓縮。unified/git diff 可依
+「行角色」乾淨分類——未變更的 context 行以空格開頭、純屬噪音，其餘都是該留的結構。
+策略丟掉 ` ` 開頭的 context，保留每個 hunk header（`@@`）、檔頭
+（`diff`/`index`/`---`/`+++`）與所有 `+`/`-` 變更行，末尾附
+`dropped N diff context lines | sha256:…` 標記。好處與 log 同源：埋在大段 context 中
+的變更在這裡會存活，頭尾截斷則會丟掉它——而 hunk header 仍帶著精確行號範圍，CCR
+store 也保有完整原文可逆。嗅探必須有真正的 `@@` hunk header（避免把 markdown 的
+`+`/`-` 條列誤判成 diff）且可丟 context ≥ 30%（否則落到 `truncate` 兜底）。它註冊在
+log **之前**：帶 `@@` 的 diff 結構應優先於 log 嚴重度分類，而真 log 不帶 hunk header
+故兩者不衝突。與 log 一致，刻意全用 ASCII byte 前綴（`starts_with(" ")` / `"@@"`）而非
+`strip`/`trim`，避開 Python unicode 空白與 Rust 分岔的地雷。新增 `07_diff.json`
+fixture 走完整 pipeline 壓 7227→1857 bytes，兩語言逐字節一致。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 59 tests
+cd rewrite && uv run pytest -q              # 69 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 72 tests
+cd rewrite/rust-lite && cargo test          # 81 tests
 
-# Cross-language parity gate / 跨語言 parity gate（6 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（7 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
