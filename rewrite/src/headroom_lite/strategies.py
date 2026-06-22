@@ -223,8 +223,103 @@ def _diff_squeeze(text: str, store=None) -> str:
 # diff 結構比 log 嚴重度分類更該優先保留（既有 log 內容無 hunk header，互不干擾）。
 DIFF = Strategy("diff", _diff_applies, _diff_squeeze)
 
-# 策略註冊表：按優先序排列。diff/log 先嗅探，不命中才落到 truncate 兜底。
-STRATEGIES: tuple[Strategy, ...] = (DIFF, LOG, TRUNCATE)
+
+# ── M14 — search 內容感知策略（第三片「嗅探→壓」內容策略）──
+#
+# 對象：grep/rg 的 `file:lineno:content` 輸出。噪音 = 同一檔案的大量重複命中；
+# 訊號 = 命中分布在哪些檔、每檔的代表性前幾筆。壓法：每檔保留前 KEEP_PER_FILE 筆、
+# 其餘丟掉（保序），末尾附標記。非 match 行（heading、空行、context 分隔）一律保留。
+#
+# ⚠️ parity 地雷（誠實記錄）：若只用「`:` 分隔、第二欄全數字」判 match line，會誤判 log
+# 時間戳 `10:30:45`（正是 `欄:數字:欄`）→ search 反吃 log、污染 M12 行為。解法：要求
+# file_key（首個 `:` 前）**含 `/`**。真實 `grep -rn pat .` 必帶路徑（`./src/foo.py:12:`）、
+# 時間戳前綴（`2026-06-20T10`）無 `/` → 乾淨排除。純 byte 檢查（`"/" in s`），兩語言一致。
+# 代價：cwd 下無 `/` 的單檔 grep（`foo.txt:12:`）不認領 → 落 truncate 兜底，可接受。
+#
+# 與 log/diff 對稱：嗅探只看「會丟多少」（drop flags），不另設玄學門檻；Rust squeeze 純
+# 函式回 None、put 在呼叫端。確定性靠「保序逐行掃 + per-file 計數」，從不迭代 dict → 無
+# 雜湊順序依賴，Py/Rs 逐字節一致。
+
+MIN_SEARCH_LINES = 6  # 太少行不值得當 search 處理
+SEARCH_DROP_RATIO = 0.3  # 可丟（超出每檔上限）行佔比下限 —— 低於此交給 truncate
+KEEP_PER_FILE = 3  # 每檔保留的代表性命中筆數
+
+
+def _match_line_key(line: str):
+    """grep/rg match 行判斷：回 (是否 match, file_key)。
+
+    形如 `file:lineno:content`，且 file_key 必須含 `/`（排除 log 時間戳誤判）、
+    lineno 必須非空且全 ASCII 數字。非 match 行回 (False, "")。
+    """
+    i1 = line.find(":")
+    if i1 <= 0:  # 無冒號，或 file_key 為空（行首即冒號）
+        return False, ""
+    file_key = line[:i1]
+    if "/" not in file_key:  # 必須像路徑 —— 擋掉 `10:30:45` 這類時間戳
+        return False, ""
+    i2 = line.find(":", i1 + 1)
+    if i2 == -1:
+        return False, ""
+    lineno = line[i1 + 1 : i2]
+    # 刻意只認 ASCII 數字（與 Rust `is_ascii_digit` 逐字節對齊；不用 str.isdigit 認 unicode）
+    if not lineno or not all(0x30 <= ord(c) <= 0x39 for c in lineno):
+        return False, ""
+    return True, file_key
+
+
+def _search_drop_flags(lines: list[str]) -> list[bool]:
+    """保序逐行掃：每個 file_key 計數，超過 KEEP_PER_FILE 的 match 行標記為「丟」。
+
+    只用 dict 做計數查找、從不迭代 dict —— 結果僅依輸入順序，無雜湊順序依賴（parity）。
+    """
+    counts: dict[str, int] = {}
+    flags: list[bool] = []
+    for line in lines:
+        is_match, key = _match_line_key(line)
+        if not is_match:
+            flags.append(False)
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        flags.append(counts[key] > KEEP_PER_FILE)
+    return flags
+
+
+def _search_applies(text: str) -> bool:
+    """嗅探：夠多行、且超出每檔上限的可丟命中佔比夠高才認領；否則讓後手兜底。"""
+    lines = text.split("\n")
+    total = len(lines)
+    if total < MIN_SEARCH_LINES:
+        return False
+    dropped = sum(_search_drop_flags(lines))
+    if dropped == 0:
+        return False
+    return dropped / total >= SEARCH_DROP_RATIO
+
+
+def _search_squeeze(text: str, store=None) -> str:
+    """每檔保留前 KEEP_PER_FILE 筆命中、丟其餘，末尾附標記。
+
+    沒超量可丟 → 原文回、絕不 put（神聖時機契約）。
+    """
+    lines = text.split("\n")
+    flags = _search_drop_flags(lines)
+    dropped = sum(flags)
+    if dropped == 0:
+        return text  # 沒得丟 → 原文回，不 put
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    digest = content_key(text)
+    kept = [line for line, drop in zip(lines, flags) if not drop]
+    marker = f"[... headroom-lite dropped {dropped} search result lines | sha256:{digest} ...]"
+    return "\n".join([*kept, marker])
+
+
+# search 排在 diff 之後、log 之前：grep-over-logs 由 search 接管（貼合「跨檔看命中」意圖）；
+# 既有 log 內容無 `/`+數字 match 行 → search 不認領，不回歸 M12 行為。
+SEARCH = Strategy("search", _search_applies, _search_squeeze)
+
+# 策略註冊表：按優先序排列。diff/search/log 先嗅探，不命中才落到 truncate 兜底。
+STRATEGIES: tuple[Strategy, ...] = (DIFF, SEARCH, LOG, TRUNCATE)
 
 
 def squeeze_text(text: str, store=None, strategies: tuple[Strategy, ...] = STRATEGIES) -> str:

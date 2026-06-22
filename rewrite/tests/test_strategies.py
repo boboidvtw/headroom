@@ -280,3 +280,92 @@ def test_diff_no_drop_returns_text_without_put():
 def test_diff_registered_before_log_and_truncate():
     names = [s.name for s in STRATEGIES]
     assert names.index("diff") < names.index("log") < names.index("truncate")
+
+
+# ── M14：search 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import SEARCH, _match_line_key, _search_squeeze
+
+
+def _search(n_files: int = 3, per_file: int = 12) -> str:
+    """grep/rg 風格輸出：每檔多筆命中（超過 KEEP_PER_FILE → 可丟）。"""
+    lines = []
+    for f in range(n_files):
+        for ln in range(per_file):
+            lines.append(f"./src/module_{f}.py:{ln + 1}:    result = compute(value_{ln})")
+    return "\n".join(lines)
+
+
+def test_search_match_line_requires_slash_in_path():
+    # 真 grep 行（含路徑）→ match。
+    ok, key = _match_line_key("./src/foo.py:42:hit")
+    assert ok is True and key == "./src/foo.py"
+
+
+def test_search_match_line_rejects_timestamp():
+    # ⚠️ 地雷防線：log 時間戳 `10:30:45` 不含 `/` → 不可被當成 match line。
+    assert _match_line_key("2026-06-20T10:30:45 ERROR boom")[0] is False
+    assert _match_line_key("10:30:45 something")[0] is False
+
+
+def test_search_applies_on_grep_output():
+    # 每檔 12 筆、保 3 丟 9 → 可丟佔比高，search 認領。
+    assert SEARCH.applies(_search()) is True
+
+
+def test_search_applies_false_on_prose():
+    prose = "\n".join(f"This is sentence number {i} about nothing." for i in range(30))
+    assert SEARCH.applies(prose) is False
+
+
+def test_search_applies_false_when_under_cap():
+    # 每檔只 2 筆（≤ KEEP_PER_FILE）→ 無可丟，不認領。
+    text = _search(n_files=5, per_file=2)
+    assert SEARCH.applies(text) is False
+
+
+def test_search_squeeze_caps_per_file():
+    from headroom_lite.strategies import KEEP_PER_FILE
+    out = _search_squeeze(_search(n_files=3, per_file=12))
+    # 每檔保留恰好 KEEP_PER_FILE 筆。
+    for f in range(3):
+        assert out.count(f"./src/module_{f}.py:") == KEEP_PER_FILE
+    assert "dropped" in out
+
+
+def test_search_marker_has_count_and_key():
+    text = _search(n_files=3, per_file=12)  # 每檔丟 9 → 共丟 27
+    out = squeeze_text(text)
+    assert f"sha256:{content_key(text)}" in out
+    assert "dropped 27 search result lines" in out
+
+
+def test_search_deterministic():
+    text = _search()
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_search_stores_original_before_squeezing():
+    store = _SpyStore()
+    text = _search()
+    squeeze_text(text, store=store)
+    assert store.puts == [text]
+
+
+def test_search_no_drop_returns_text_without_put():
+    # 防禦性：squeeze 直呼但無超量可丟 → 原文回、絕不 put。
+    store = _SpyStore()
+    text = _search(n_files=4, per_file=2)
+    assert _search_squeeze(text, store) == text
+    assert store.puts == []
+
+
+def test_search_does_not_swallow_logs():
+    # 關鍵不回歸：噪音 log 仍走 log（含時間戳但無 /+數字 match 行）→ search 不吃。
+    log = _noisy_log()
+    assert SEARCH.applies(log) is False
+    assert "log lines" in squeeze_text(log)  # 仍是 log 策略的標記
+
+
+def test_search_registered_after_diff_before_log():
+    names = [s.name for s in STRATEGIES]
+    assert names.index("diff") < names.index("search") < names.index("log") < names.index("truncate")

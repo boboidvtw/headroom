@@ -9,8 +9,8 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, LOG, STRATEGIES, TAIL_LINES,
-    TRUNCATE,
+    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, LOG, SEARCH, STRATEGIES,
+    TAIL_LINES, TRUNCATE,
 };
 
 fn long_text() -> String {
@@ -304,4 +304,89 @@ fn diff_registered_before_log_and_truncate() {
 fn diff_deterministic() {
     let d = diff();
     assert_eq!(squeeze_text(&d), squeeze_text(&d));
+}
+
+// ── M14：search 內容感知策略（對齊 Python test_strategies.py）──
+
+/// grep/rg 風格輸出：每檔多筆命中（超過 KEEP_PER_FILE → 可丟）。
+fn search_text(n_files: usize, per_file: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for f in 0..n_files {
+        for ln in 0..per_file {
+            lines.push(format!("./src/module_{f}.py:{}:    result = compute(value_{ln})", ln + 1));
+        }
+    }
+    lines.join("\n")
+}
+fn search_default() -> String {
+    search_text(3, 12)
+}
+
+#[test]
+fn search_applies_on_grep_output() {
+    assert!((SEARCH.applies)(&search_default()));
+}
+
+#[test]
+fn search_applies_false_on_prose() {
+    let prose = (0..30)
+        .map(|i| format!("This is sentence number {i} about nothing."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(SEARCH.applies)(&prose));
+}
+
+#[test]
+fn search_applies_false_when_under_cap() {
+    // 每檔只 2 筆（≤ KEEP_PER_FILE）→ 無可丟，不認領。
+    assert!(!(SEARCH.applies)(&search_text(5, 2)));
+}
+
+#[test]
+fn search_squeeze_caps_per_file() {
+    let out = (SEARCH.squeeze)(&search_text(3, 12)).expect("grep 輸出該壓");
+    // 每檔保留恰好 3 筆（KEEP_PER_FILE）。
+    for f in 0..3 {
+        assert_eq!(out.matches(&format!("./src/module_{f}.py:")).count(), 3);
+    }
+    assert!(out.contains("dropped"));
+}
+
+#[test]
+fn search_marker_has_count_and_key() {
+    let text = search_text(3, 12); // 每檔丟 9 → 共丟 27
+    let out = squeeze_text(&text).expect("grep 輸出該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&text))));
+    assert!(out.contains("dropped 27 search result lines"));
+}
+
+#[test]
+fn search_no_drop_returns_none() {
+    // 防禦性：squeeze 直呼但無超量可丟 → None（呼叫端保留原文、不 put）。
+    assert_eq!((SEARCH.squeeze)(&search_text(4, 2)), None);
+}
+
+#[test]
+fn search_does_not_swallow_logs() {
+    // 關鍵不回歸：噪音 log 仍走 log（含時間戳但無 /+數字 match 行）→ search 不吃。
+    let log = noisy_log();
+    assert!(!(SEARCH.applies)(&log));
+    let out = squeeze_text(&log).expect("log 該壓");
+    assert!(out.contains("log lines")); // 仍是 log 策略的標記
+}
+
+#[test]
+fn search_registered_after_diff_before_log() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let d = names.iter().position(|&n| n == "diff").unwrap();
+    let s = names.iter().position(|&n| n == "search").unwrap();
+    let l = names.iter().position(|&n| n == "log").unwrap();
+    let t = names.iter().position(|&n| n == "truncate").unwrap();
+    assert!(d < s && s < l && l < t, "順序須為 diff < search < log < truncate");
+}
+
+#[test]
+fn search_deterministic() {
+    let text = search_default();
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
 }

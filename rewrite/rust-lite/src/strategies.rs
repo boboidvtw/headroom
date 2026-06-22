@@ -17,6 +17,7 @@
 //! 標記格式必須與 Python 版逐字相同 —— 跨語言 parity 的前提。
 
 use crate::ccr::content_key;
+use std::collections::HashMap;
 
 pub const HEAD_LINES: usize = 20;
 pub const TAIL_LINES: usize = 10;
@@ -246,8 +247,106 @@ pub const DIFF: Strategy = Strategy {
     squeeze: diff_squeeze,
 };
 
-/// 策略註冊表：按優先序排列。diff/log 先嗅探，不命中才落到 truncate 兜底。
-pub const STRATEGIES: &[Strategy] = &[DIFF, LOG, TRUNCATE];
+// ── M14 — search 內容感知策略（Rust port，對齊 Python `strategies.py`）──
+//
+// 對象：grep/rg 的 `file:lineno:content` 輸出。噪音 = 同一檔案的大量重複命中；訊號 =
+// 命中分布在哪些檔、每檔代表性前幾筆。壓法：每檔保留前 KEEP_PER_FILE 筆、其餘丟，保序。
+//
+// parity 地雷（誠實記錄）：只用「`:` 分隔、第二欄全數字」會誤判 log 時間戳 `10:30:45`
+// → search 反吃 log。解法：要求 file_key（首個 `:` 前）含 `/` —— 真 `grep -rn pat .` 必帶
+// 路徑、時間戳前綴無 `/`。純 ASCII byte 檢查，兩語言一致。
+//
+// 確定性：保序逐行掃 + per-file 計數（HashMap 只做查找/累加、從不迭代）→ 無雜湊順序依賴。
+// 收存點不對稱承襲 M11/12/13：Rust squeeze 純函式回 Option、put 在 compress_block 呼叫端。
+
+const MIN_SEARCH_LINES: usize = 6;
+const SEARCH_DROP_RATIO: f64 = 0.3;
+const KEEP_PER_FILE: usize = 3;
+
+/// grep/rg match 行判斷：回 `Some(file_key)` 或 `None`。
+/// 形如 `file:lineno:content`，file_key 須含 `/`（排除時間戳）、lineno 須非空全 ASCII 數字。
+fn match_line_key(line: &str) -> Option<&str> {
+    let i1 = line.find(':')?;
+    if i1 == 0 {
+        return None; // file_key 為空（行首即冒號）
+    }
+    let file_key = &line[..i1];
+    if !file_key.contains('/') {
+        return None; // 必須像路徑 —— 擋掉 `10:30:45` 這類時間戳
+    }
+    let rest = &line[i1 + 1..];
+    let i2 = rest.find(':')?;
+    let lineno = &rest[..i2];
+    if lineno.is_empty() || !lineno.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(file_key)
+}
+
+/// 保序逐行掃：每個 file_key 計數，超過 KEEP_PER_FILE 的 match 行標記為「丟」。
+/// HashMap 只做查找/累加、從不迭代 —— 結果僅依輸入順序，無雜湊順序依賴（parity）。
+fn search_drop_flags(lines: &[&str]) -> Vec<bool> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    lines
+        .iter()
+        .map(|line| match match_line_key(line) {
+            Some(key) => {
+                let c = counts.entry(key).or_insert(0);
+                *c += 1;
+                *c > KEEP_PER_FILE
+            }
+            None => false,
+        })
+        .collect()
+}
+
+/// 嗅探：夠多行、且超出每檔上限的可丟命中佔比夠高才認領；否則讓後手兜底。
+fn search_applies(text: &str) -> bool {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let total = lines.len();
+    if total < MIN_SEARCH_LINES {
+        return false;
+    }
+    let dropped = search_drop_flags(&lines).iter().filter(|d| **d).count();
+    if dropped == 0 {
+        return false;
+    }
+    (dropped as f64 / total as f64) >= SEARCH_DROP_RATIO
+}
+
+/// 每檔保留前 KEEP_PER_FILE 筆命中、丟其餘，末尾附標記。
+/// 沒超量可丟回 `None`（呼叫端保留原文、不 put）。
+fn search_squeeze(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let flags = search_drop_flags(&lines);
+    let dropped = flags.iter().filter(|d| **d).count();
+    if dropped == 0 {
+        return None;
+    }
+    let marker = format!(
+        "[... headroom-lite dropped {dropped} search result lines | sha256:{} ...]",
+        content_key(text)
+    );
+    let mut parts: Vec<&str> = lines
+        .iter()
+        .zip(&flags)
+        .filter(|(_, drop)| !**drop)
+        .map(|(line, _)| *line)
+        .collect();
+    parts.push(&marker);
+    Some(parts.join("\n"))
+}
+
+/// search 排在 diff 之後、log 之前：grep-over-logs 由 search 接管；既有 log 內容無
+/// `/`+數字 match 行 → search 不認領，不回歸 M12 行為。
+pub const SEARCH: Strategy = Strategy {
+    name: "search",
+    applies: search_applies,
+    squeeze: search_squeeze,
+};
+
+/// 策略註冊表：按優先序排列。diff/search/log 先嗅探，不命中才落到 truncate 兜底。
+pub const STRATEGIES: &[Strategy] = &[DIFF, SEARCH, LOG, TRUNCATE];
 
 /// dispatcher：選第一個 applies 命中的策略來壓，命中即停。預設用模組級註冊表。
 pub fn squeeze_text(text: &str) -> Option<String> {
