@@ -369,3 +369,101 @@ def test_search_does_not_swallow_logs():
 def test_search_registered_after_diff_before_log():
     names = [s.name for s in STRATEGIES]
     assert names.index("diff") < names.index("search") < names.index("log") < names.index("truncate")
+
+
+# ── M15：json 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+import json as _json
+from headroom_lite.strategies import JSON, _json_squeeze, _json_squeeze_core, _starts_json
+
+
+def _json_array(n: int = 20) -> str:
+    """同質物件的大型 JSON array（compact，模擬 API 回應）。"""
+    return _json.dumps([{"id": i, "name": f"item_{i}", "active": i % 2 == 0} for i in range(n)],
+                       separators=(",", ":"))
+
+
+def test_json_starts_detector():
+    assert _starts_json('  \n  [1,2,3]') is True
+    assert _starts_json('\t{"a":1}') is True
+    assert _starts_json('hello [1,2,3]') is False  # 含括號但非 JSON 文件
+
+
+def test_json_applies_on_large_array():
+    assert JSON.applies(_json_array(20)) is True
+
+
+def test_json_applies_false_on_small_array():
+    # 元素不足 11（HEAD5+TAIL2+DROP4）→ 不認領。
+    assert JSON.applies(_json_array(8)) is False
+
+
+def test_json_applies_false_on_prose():
+    prose = "\n".join(f"sentence {i} with [brackets] and, commas" for i in range(30))
+    assert JSON.applies(prose) is False
+
+
+def test_json_squeeze_keeps_head_tail_and_valid_json():
+    from headroom_lite.strategies import JSON_HEAD, JSON_TAIL
+    out = _json_squeeze_core(_json_array(20))
+    parsed = _json.loads(out)  # 結果必須是合法 JSON
+    assert len(parsed) == JSON_HEAD + JSON_TAIL + 1  # 頭 + marker + 尾
+    assert parsed[0] == {"id": 0, "name": "item_0", "active": True}  # 頭元素原文保留
+    assert parsed[-1] == {"id": 19, "name": "item_19", "active": False}  # 尾元素保留
+    assert "dropped 13 array elements" in parsed[JSON_HEAD]  # 中間是 marker 字串
+
+
+def test_json_never_reserializes_numbers():
+    # ⭐ parity 正解驗證：1.10 這類數字照抄原文、不被正規化成 1.1。
+    text = '[' + ",".join(['{"v":1.10}'] * 20) + ']'
+    out = _json_squeeze_core(text)
+    assert "1.10" in out  # 原文保留
+    assert "1.1," not in out.replace("1.10", "")  # 沒有被正規化掉尾零
+
+
+def test_json_nested_picks_largest_array():
+    # 物件內含大 array → 找到並截斷它、外層結構照抄。
+    text = '{"meta":{"n":3},"data":' + _json_array(20) + ',"ok":true}'
+    out = _json_squeeze_core(text)
+    assert out.startswith('{"meta":{"n":3},"data":[')
+    assert out.endswith(',"ok":true}')
+    assert "dropped 13 array elements" in out
+
+
+def test_json_marker_has_count_and_key():
+    text = _json_array(20)
+    out = squeeze_text(text)
+    assert f"sha256:{content_key(text)}" in out
+    assert "dropped 13 array elements" in out
+
+
+def test_json_deterministic():
+    text = _json_array(20)
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_json_stores_original_before_squeezing():
+    store = _SpyStore()
+    text = _json_array(20)
+    squeeze_text(text, store=store)
+    assert store.puts == [text]
+
+
+def test_json_no_compress_returns_text_without_put():
+    # 防禦性：array 太小壓不動 → 原文回、絕不 put。
+    store = _SpyStore()
+    text = _json_array(8)
+    assert _json_squeeze(text, store) == text
+    assert store.puts == []
+
+
+def test_json_does_not_swallow_other_strategies():
+    # 不回歸：log/diff/search 文字非 JSON 文件（不以 [/{ 開頭）→ JSON 不認領。
+    assert JSON.applies(_noisy_log()) is False
+    assert JSON.applies(_diff()) is False
+    assert JSON.applies(_search()) is False
+
+
+def test_json_registered_first():
+    names = [s.name for s in STRATEGIES]
+    assert names[0] == "json"
+    assert names.index("json") < names.index("diff") < names.index("search") < names.index("log")

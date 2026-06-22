@@ -345,8 +345,156 @@ pub const SEARCH: Strategy = Strategy {
     squeeze: search_squeeze,
 };
 
-/// 策略註冊表：按優先序排列。diff/search/log 先嗅探，不命中才落到 truncate 兜底。
-pub const STRATEGIES: &[Strategy] = &[DIFF, SEARCH, LOG, TRUNCATE];
+// ── M15 — json 內容感知策略（Rust port，對齊 Python `strategies.py`）──
+//
+// 對象：大型 JSON 文件。找元素最多的 array，保前 JSON_HEAD + 後 JSON_TAIL 個元素、中間塞
+// marker 字串元素（結果仍合法 JSON），array 外 bytes 照抄。
+//
+// ⭐ parity 正解：**絕不重序列化任何值**。地雷是「json.dumps 把 1.10 正規化成 1.1，Rust
+// arbitrary_precision 保留 1.10 → 分岔」。解法不是硬扛 number encoder，而是 byte-level 結構
+// 掃描——被保留元素照抄原始 bytes 切片，唯一新寫的是結構字元與 marker（ASCII 常數）。
+//
+// tie-break：元素最多；同票取 start 最小（嚴格大於才替換 → 保源序最前；Python max 與 Rust
+// max_by_key 同票行為相反，故兩邊都顯式用此規則）。掃描器追蹤字串字面值與巢狀深度。
+// 收存點不對稱承襲 M11–M14：核心純函式回 Option、put 在 compress_block 呼叫端。
+
+const JSON_HEAD: usize = 5;
+const JSON_TAIL: usize = 2;
+const MIN_JSON_DROP: usize = 4;
+
+/// 一個 array 的掃描結果：(start, end, 各元素的 (start, end) byte span)。
+type ArraySpan = (usize, usize, Vec<(usize, usize)>);
+
+/// 首個非 ASCII 空白 byte 是否為 `[`/`{`（判斷整段 content 是不是 JSON 文件）。
+fn starts_json(text: &str) -> bool {
+    for b in text.bytes() {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            b'[' | b'{' => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// array 掃描 frame：物件只需 kind 佔深度，array 才追蹤元素 span。
+struct ArrFrame {
+    kind: u8,
+    start: usize,
+    elements: Vec<(usize, usize)>,
+    elem_start: usize,
+}
+
+/// 單次線性掃描，回所有 JSON array 的 (start, end, elem_spans)（byte offset）。
+/// 只在「目前最內層是 array」時把逗號當元素分隔；跳過字串字面值內字元。
+fn scan_arrays(text: &str) -> Vec<ArraySpan> {
+    let bytes = text.as_bytes();
+    let mut arrays: Vec<ArraySpan> = Vec::new();
+    let mut stack: Vec<ArrFrame> = Vec::new();
+    let (mut in_string, mut escape) = (false, false);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'[' | b'{' => stack.push(ArrFrame {
+                kind: c,
+                start: i,
+                elements: Vec::new(),
+                elem_start: i + 1,
+            }),
+            b']' | b'}' => {
+                if let Some(mut frame) = stack.pop() {
+                    if frame.kind == b'[' && c == b']' {
+                        let s = frame.elem_start;
+                        // 空 array（[]）或只有空白 → 不計為元素
+                        if !frame.elements.is_empty() || !text[s..i].trim().is_empty() {
+                            frame.elements.push((s, i));
+                        }
+                        arrays.push((frame.start, i + 1, frame.elements));
+                    }
+                }
+            }
+            b',' => {
+                if let Some(frame) = stack.last_mut() {
+                    if frame.kind == b'[' {
+                        frame.elements.push((frame.elem_start, i));
+                        frame.elem_start = i + 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    arrays
+}
+
+/// 純函式：找元素最多的 array 截斷成頭+marker+尾。壓不動回 `None`。
+fn json_squeeze_core(text: &str) -> Option<String> {
+    if !starts_json(text) {
+        return None;
+    }
+    let arrays = scan_arrays(text);
+    // tie-break：元素最多；同票保源序最前（嚴格大於才替換）。
+    let mut best: Option<&ArraySpan> = None;
+    for arr in &arrays {
+        if best.is_none() || arr.2.len() > best.unwrap().2.len() {
+            best = Some(arr);
+        }
+    }
+    let best = best?;
+    let (start, end, elems) = (best.0, best.1, &best.2);
+    if elems.len() < JSON_HEAD + JSON_TAIL + MIN_JSON_DROP {
+        return None;
+    }
+    let dropped = elems.len() - JSON_HEAD - JSON_TAIL;
+    let marker = format!(
+        "\"[... headroom-lite dropped {dropped} array elements | sha256:{} ...]\"",
+        content_key(text)
+    );
+    let mut parts: Vec<&str> = Vec::with_capacity(JSON_HEAD + JSON_TAIL + 1);
+    for &(s, e) in &elems[..JSON_HEAD] {
+        parts.push(&text[s..e]);
+    }
+    parts.push(&marker);
+    for &(s, e) in &elems[elems.len() - JSON_TAIL..] {
+        parts.push(&text[s..e]);
+    }
+    let new_array = format!("[{}]", parts.join(","));
+    Some(format!("{}{}{}", &text[..start], new_array, &text[end..]))
+}
+
+/// 嗅探：是 JSON 文件、且最大 array 元素夠多（可丟 ≥ MIN_JSON_DROP）才認領。
+fn json_applies(text: &str) -> bool {
+    json_squeeze_core(text).is_some()
+}
+
+/// 截斷最大 array；壓不動回 `None`（呼叫端保留原文、不 put）。
+fn json_squeeze(text: &str) -> Option<String> {
+    json_squeeze_core(text)
+}
+
+/// json 排最前：applies 極專一（需首字元 `[`/`{` + 11+ 元素 array），不會誤搶 diff/search/log。
+pub const JSON: Strategy = Strategy {
+    name: "json",
+    applies: json_applies,
+    squeeze: json_squeeze,
+};
+
+/// 策略註冊表：按優先序排列。json/diff/search/log 先嗅探，不命中才落到 truncate 兜底。
+pub const STRATEGIES: &[Strategy] = &[JSON, DIFF, SEARCH, LOG, TRUNCATE];
 
 /// dispatcher：選第一個 applies 命中的策略來壓，命中即停。預設用模組級註冊表。
 pub fn squeeze_text(text: &str) -> Option<String> {

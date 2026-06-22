@@ -9,7 +9,7 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, LOG, SEARCH, STRATEGIES,
+    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, JSON, LOG, SEARCH, STRATEGIES,
     TAIL_LINES, TRUNCATE,
 };
 
@@ -388,5 +388,105 @@ fn search_registered_after_diff_before_log() {
 #[test]
 fn search_deterministic() {
     let text = search_default();
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
+
+// ── M15：json 內容感知策略（對齊 Python test_strategies.py）──
+
+/// 同質物件的大型 compact JSON array（模擬 API 回應）。
+fn json_array(n: usize) -> String {
+    let items: Vec<String> = (0..n)
+        .map(|i| format!("{{\"id\":{i},\"name\":\"item_{i}\",\"active\":{}}}", i % 2 == 0))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+#[test]
+fn json_applies_on_large_array() {
+    assert!((JSON.applies)(&json_array(20)));
+}
+
+#[test]
+fn json_applies_false_on_small_array() {
+    // 元素不足 11（HEAD5+TAIL2+DROP4）→ 不認領。
+    assert!(!(JSON.applies)(&json_array(8)));
+}
+
+#[test]
+fn json_applies_false_on_prose() {
+    let prose = (0..30)
+        .map(|i| format!("sentence {i} with [brackets] and, commas"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(JSON.applies)(&prose));
+}
+
+#[test]
+fn json_squeeze_keeps_head_tail() {
+    let out = (JSON.squeeze)(&json_array(20)).expect("大 array 該壓");
+    // 頭元素原文保留、尾元素保留、中間 marker。
+    assert!(out.starts_with("[{\"id\":0,\"name\":\"item_0\",\"active\":true}"));
+    assert!(out.ends_with("{\"id\":19,\"name\":\"item_19\",\"active\":false}]"));
+    assert!(out.contains("dropped 13 array elements"));
+}
+
+#[test]
+fn json_never_reserializes_numbers() {
+    // ⭐ parity 正解驗證：1.10 照抄原文、不被正規化成 1.1。
+    let elems: Vec<&str> = (0..20).map(|_| "{\"v\":1.10}").collect();
+    let text = format!("[{}]", elems.join(","));
+    let out = json_squeeze_core_via_squeeze(&text);
+    assert!(out.contains("1.10"));
+}
+
+/// 透過公開的 JSON.squeeze 取核心輸出（core 為私有）。
+fn json_squeeze_core_via_squeeze(text: &str) -> String {
+    (JSON.squeeze)(text).expect("該壓")
+}
+
+#[test]
+fn json_nested_picks_largest_array() {
+    // 物件內含大 array → 找到並截斷它、外層結構照抄。
+    let text = format!("{{\"meta\":{{\"n\":3}},\"data\":{},\"ok\":true}}", json_array(20));
+    let out = (JSON.squeeze)(&text).expect("巢狀大 array 該壓");
+    assert!(out.starts_with("{\"meta\":{\"n\":3},\"data\":["));
+    assert!(out.ends_with(",\"ok\":true}"));
+    assert!(out.contains("dropped 13 array elements"));
+}
+
+#[test]
+fn json_marker_has_count_and_key() {
+    let text = json_array(20);
+    let out = squeeze_text(&text).expect("大 array 該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&text))));
+    assert!(out.contains("dropped 13 array elements"));
+}
+
+#[test]
+fn json_no_compress_returns_none() {
+    // 防禦性：array 太小壓不動 → None（呼叫端保留原文、不 put）。
+    assert_eq!((JSON.squeeze)(&json_array(8)), None);
+}
+
+#[test]
+fn json_does_not_swallow_other_strategies() {
+    // 不回歸：log/diff/search 文字非 JSON 文件（不以 [/{ 開頭）→ JSON 不認領。
+    assert!(!(JSON.applies)(&noisy_log()));
+    assert!(!(JSON.applies)(&diff()));
+    assert!(!(JSON.applies)(&search_default()));
+}
+
+#[test]
+fn json_registered_first() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    assert_eq!(names[0], "json");
+    let j = names.iter().position(|&n| n == "json").unwrap();
+    let d = names.iter().position(|&n| n == "diff").unwrap();
+    assert!(j < d, "json 須排最前");
+}
+
+#[test]
+fn json_deterministic() {
+    let text = json_array(20);
     assert_eq!(squeeze_text(&text), squeeze_text(&text));
 }

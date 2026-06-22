@@ -318,8 +318,127 @@ def _search_squeeze(text: str, store=None) -> str:
 # 既有 log 內容無 `/`+數字 match 行 → search 不認領，不回歸 M12 行為。
 SEARCH = Strategy("search", _search_applies, _search_squeeze)
 
-# 策略註冊表：按優先序排列。diff/search/log 先嗅探，不命中才落到 truncate 兜底。
-STRATEGIES: tuple[Strategy, ...] = (DIFF, SEARCH, LOG, TRUNCATE)
+
+# ── M15 — json 內容感知策略（第四片「嗅探→壓」內容策略）──
+#
+# 對象：大型 JSON 文件（API 回應、jq 輸出等）。噪音 = 同質元素的大型 array；訊號 =
+# 結構與頭尾代表性元素。壓法：找元素最多的 array，保前 JSON_HEAD + 後 JSON_TAIL 個元素、
+# 中間塞一個 marker 字串元素（結果仍是合法 JSON array），array 外的 bytes 照抄。
+#
+# ⭐ parity 正解（本片最重要的設計）：**絕不重序列化任何值**。先前評估 JSON 的地雷是
+# 「截斷後 json.dumps 把 `1.10` 正規化成 `1.1`，而 Rust arbitrary_precision 保留原樣 →
+# 分岔」。解法不是硬扛 number encoder 對齊，而是改用 **byte-level 結構掃描**：被保留的
+# 元素一律照抄原始 bytes 切片（數字/字串/巢狀物件原文不動），唯一新寫的是結構字元
+# （`[` `,` `]`）與 marker —— 全是 ASCII 常數。如此 Python 與 Rust 不可能在值上分岔。
+#
+# 掃描器逐字元走訪、追蹤字串字面值（跳過字串內的括號/逗號）與巢狀深度，逐 array 記錄
+# 元素 byte span。確定性：tie-break 取「元素最多；同票取 start 最小（源序最前）」，Py/Rs
+# 一致（Python max / Rust max_by_key 在同票時行為相反，故顯式用『嚴格大於才替換』保最前）。
+#
+# 防誤判：要求 content 首個非空白字元是 `[`/`{`（純 ASCII 檢查）—— 只吃真 JSON 文件，
+# 不碰含括號的 log/prose。收存點不對稱承襲 M11–M14：核心純函式、put 在呼叫端。
+
+JSON_HEAD = 5  # 保留 array 開頭元素數
+JSON_TAIL = 2  # 保留 array 結尾元素數
+MIN_JSON_DROP = 4  # 至少要丟這麼多元素才值得壓（否則 marker 開銷可能蓋過收益）
+
+
+def _starts_json(text: str) -> bool:
+    """首個非 ASCII 空白字元是否為 `[`/`{`（判斷整段 content 是不是 JSON 文件）。"""
+    for c in text:
+        if c in " \t\n\r":
+            continue
+        return c in "[{"
+    return False
+
+
+def _scan_arrays(text: str) -> list[tuple[int, int, list[tuple[int, int]]]]:
+    """單次線性掃描，回所有 JSON array 的 (start, end, elem_spans)。
+
+    elem_spans = 各元素的 (start, end) char offset（含前後空白、不含分隔逗號）。正確處理
+    巢狀（只在「目前最內層是 array」時才把逗號當元素分隔）與字串字面值（跳過字串內字元）。
+    """
+    arrays: list[tuple[int, int, list[tuple[int, int]]]] = []
+    stack: list[dict] = []
+    i, n = 0, len(text)
+    in_string = escape = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+        elif c in "[{":
+            frame = {"kind": c, "start": i, "elements": [], "elem_start": i + 1 if c == "[" else None}
+            stack.append(frame)
+        elif c in "]}":
+            frame = stack.pop() if stack else None
+            if frame is not None and frame["kind"] == "[" and c == "]":
+                s = frame["elem_start"]
+                # 收最後一個元素；空 array（[]）或只有空白 → 不計為元素
+                if frame["elements"] or text[s:i].strip() != "":
+                    frame["elements"].append((s, i))
+                arrays.append((frame["start"], i + 1, frame["elements"]))
+        elif c == "," and stack and stack[-1]["kind"] == "[":
+            frame = stack[-1]
+            frame["elements"].append((frame["elem_start"], i))
+            frame["elem_start"] = i + 1
+        i += 1
+    return arrays
+
+
+def _json_squeeze_core(text: str) -> str | None:
+    """純函式：找元素最多的 array 截斷成頭+marker+尾。壓不動回 None。"""
+    if not _starts_json(text):
+        return None
+    arrays = _scan_arrays(text)
+    # tie-break：元素最多；同票取 start 最小（嚴格大於才替換 → 保源序最前，Py/Rs 一致）
+    best: tuple[int, int, list[tuple[int, int]]] | None = None
+    for arr in arrays:
+        if best is None or len(arr[2]) > len(best[2]):
+            best = arr
+    if best is None:
+        return None
+    start, end, elems = best
+    dropped = len(elems) - JSON_HEAD - JSON_TAIL
+    if dropped < MIN_JSON_DROP:
+        return None
+    head = [text[s:e] for s, e in elems[:JSON_HEAD]]
+    tail = [text[s:e] for s, e in elems[-JSON_TAIL:]]
+    digest = content_key(text)
+    marker = f'"[... headroom-lite dropped {dropped} array elements | sha256:{digest} ...]"'
+    new_array = "[" + ",".join([*head, marker, *tail]) + "]"
+    return text[:start] + new_array + text[end:]
+
+
+def _json_applies(text: str) -> bool:
+    """嗅探：是 JSON 文件、且最大 array 元素夠多（可丟 ≥ MIN_JSON_DROP）才認領。"""
+    return _json_squeeze_core(text) is not None
+
+
+def _json_squeeze(text: str, store=None) -> str:
+    """截斷最大 array；壓不動 → 原文回、絕不 put（神聖時機契約）。"""
+    out = _json_squeeze_core(text)
+    if out is None:
+        return text
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    return out
+
+
+# json 排最前：applies 極專一（需首字元 `[`/`{` + 11+ 元素 array），不會誤搶 diff/search/log；
+# 真 JSON array 的 tool_result 本就該由此壓。
+JSON = Strategy("json", _json_applies, _json_squeeze)
+
+# 策略註冊表：按優先序排列。json/diff/search/log 先嗅探，不命中才落到 truncate 兜底。
+STRATEGIES: tuple[Strategy, ...] = (JSON, DIFF, SEARCH, LOG, TRUNCATE)
 
 
 def squeeze_text(text: str, store=None, strategies: tuple[Strategy, ...] = STRATEGIES) -> str:
