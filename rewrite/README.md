@@ -42,6 +42,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M11 | `4e10def` | pluggable content-sniffing compression strategy dispatcher (skeleton) | pure refactor of live-zone — `Strategy = (applies, squeeze)`, `TRUNCATE` as catch-all; adding log/search/diff later = one strategy + register; `store.put` timing stays inside the strategy (sacred spec); Py/Rs store-side asymmetry but markers byte-identical ⇒ parity holds; proven byte-identical vs pre-refactor across 92 inputs + cross-language differential + adversarial fuzz |
 | M12 | `4020ee2` | first real content-aware strategy: **log compression** | classify lines by severity, drop noise (`TRACE/DEBUG/INFO`), keep signal (`WARN/ERROR/FATAL/CRITICAL`) + others; marker = `dropped N log lines` + `content_key`. Beats blind head/tail truncation on the thing that matters: ERRORs buried in the **middle** — truncate keeps only head+tail and loses them, log sniffs every line and keeps each one (content-aware trade: keep errors over raw byte ratio). Claims only when noise ≥ 30% (else falls through to truncate, so all-error logs aren't swallowed). Whole-word match (`INFORMATION ≠ INFO`), byte-level ASCII boundaries, Py/Rs byte-identical. Existing `01_messy_full` (a real log) auto-routes to log: 14473→**1147** (truncate was 2524) — smaller *and* signal-preserving; new `06_noisy_log` fixture locks the keep-middle-errors branch |
 | M13 | _local_ | second content-aware strategy: **diff compression** | classify unified/git-diff lines by role, drop unchanged context (` ` space-prefixed), keep every structural line: hunk headers (`@@`), file headers (`diff`/`index`/`---`/`+++`), and all `+`/`-` changes; marker = `dropped N diff context lines` + `content_key`. Same win as log on buried signal: changes scattered in a large context block — truncate keeps only head+tail and loses the middle ones, diff sniffs every line and keeps each change (hunk headers already encode line ranges; CCR store holds the original for reversal). Claims only with a hunk header present (so markdown `+`/`-` bullets aren't mistaken for a diff) and context ≥ 30% (else falls through to truncate). Registered **before** log — a `@@`-bearing diff's structure outranks log severity classification (existing logs have no hunk header, so they don't collide). Pure ASCII byte prefixes (no `strip`/`trim` unicode divergence), Py/Rs byte-identical. New `07_diff.json` fixture: 7227→**1857** bytes through the full pipeline, cross-language byte-for-byte |
+| M14 | _local_ | third content-aware strategy: **search compression** | grep/rg `file:lineno:content` output — cap matches per file (keep first 3, drop the rest), marker = `dropped N search result lines` + `content_key`. The teaching landmine: detecting a match line by "`:`-split, second field all digits" also matches log timestamps (`10:30:45` is literally `field:digits:field`) — so search would cannibalize logs. Fix: require the file_key (before the first `:`) to contain a `/`; real `grep -rn pat .` always carries a path (`./src/foo.py:12:`), a timestamp prefix (`2026-06-20T10`) never does — a pure ASCII byte check, identical across languages. Registered `(DIFF, SEARCH, LOG, TRUNCATE)`: grep-over-logs routes to search, but existing logs have no `/`-bearing `file:line:` lines so they still route to log (no M12 regression). Determinism via in-order scan + per-file counts (HashMap looked up, never iterated → no hash-order dependence). New `08_search.json` fixture: 4289→**1702** bytes, byte-for-byte |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -154,16 +155,50 @@ log **之前**：帶 `@@` 的 diff 結構應優先於 log 嚴重度分類，而�
 `strip`/`trim`，避開 Python unicode 空白與 Rust 分岔的地雷。新增 `07_diff.json`
 fixture 走完整 pipeline 壓 7227→1857 bytes，兩語言逐字節一致。
 
+## Notes — M14 (2026-06-22)
+
+M14 added the **third content-aware strategy**: search compression for grep/rg
+`file:lineno:content` output. The noise is many repeated matches in the same file,
+so the strategy caps each file to its first 3 matches, drops the rest, and appends a
+`dropped N search result lines | sha256:…` marker. The interesting part is a parity
+landmine: the obvious match-line detector — "split on `:`, second field is all
+digits" — also matches a log timestamp like `10:30:45`, which would make search
+cannibalize logs and undo M12. The fix is a single robust discriminator: require the
+file_key (text before the first `:`) to contain a `/`. Real `grep -rn pattern .`
+output always carries a path (`./src/foo.py:12:`); a timestamp prefix
+(`2026-06-20T10`) never does. It's a pure ASCII byte check (`'/' in key`), identical
+across Python and Rust. With that, search registers as `(DIFF, SEARCH, LOG,
+TRUNCATE)` — a grep over log files routes to search, but the existing noisy-log
+fixtures carry no `/`-bearing `file:line:` lines so they still route to log, with no
+regression. Determinism comes from an in-order scan plus per-file counts in a map
+that is only ever looked up, never iterated, so there's no hash-ordering dependence.
+New `08_search.json` runs the full pipeline 4289→1702 bytes, byte-for-byte.
+
+## Notes — M14（2026-06-22）
+
+M14 接上**第三片內容感知策略**：search 壓縮，對象是 grep/rg 的
+`file:lineno:content` 輸出。噪音是同一檔案的大量重複命中，所以策略把每檔上限壓到
+前 3 筆、丟掉其餘，末尾附 `dropped N search result lines | sha256:…` 標記。有意思的
+是一個 parity 地雷：最直覺的 match line 判斷——「以 `:` 分隔、第二欄全是數字」——
+會同時命中 log 時間戳 `10:30:45`（它字面上就是 `欄:數字:欄`），這會讓 search 反過來
+吃掉 log、推翻 M12。解法是一個夠穩的判別式：要求 file_key（首個 `:` 之前）含有 `/`。
+真實 `grep -rn pat .` 輸出一定帶路徑（`./src/foo.py:12:`），時間戳前綴
+（`2026-06-20T10`）則不會——這是純 ASCII byte 檢查（`'/' in key`），Python 與 Rust
+一致。據此 search 註冊為 `(DIFF, SEARCH, LOG, TRUNCATE)`：grep 搜 log 檔會走 search，
+但既有的噪音 log fixture 沒有帶 `/` 的 `file:line:` 行，仍走 log、不回歸。確定性來自
+保序逐行掃 + per-file 計數的 map——只查找、從不迭代，故無雜湊順序依賴。新增
+`08_search.json` 走完整 pipeline 壓 4289→1702 bytes，逐字節一致。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 69 tests
+cd rewrite && uv run pytest -q              # 81 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 81 tests
+cd rewrite/rust-lite && cargo test          # 90 tests
 
-# Cross-language parity gate / 跨語言 parity gate（7 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（8 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
