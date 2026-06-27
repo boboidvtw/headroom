@@ -493,8 +493,143 @@ pub const JSON: Strategy = Strategy {
     squeeze: json_squeeze,
 };
 
-/// 策略註冊表：按優先序排列。json/diff/search/log 先嗅探，不命中才落到 truncate 兜底。
-pub const STRATEGIES: &[Strategy] = &[JSON, DIFF, SEARCH, LOG, TRUNCATE];
+// ── M16 — stack trace 內容感知策略（Rust port，對齊 Python `strategies.py`）──
+//
+// 對象：遞迴爆炸 / 深框架的 stack trace（Python `File "..."`、Java/JS `at ...(`）。把 trace
+// 切成 frame，保前 STACK_KEEP_HEAD + 後 STACK_KEEP_TAIL 個 frame、丟中段 frame（連同續行），
+// 非 frame 行（`Traceback` 標頭、最終 `XxxError: msg`、chained-exception 分隔）一律保留。
+//
+// 與盲目頭尾截斷的差別：truncate 以「行」為單位會切半個 frame，且尾端多行非 frame 訊息時
+// 可能擠掉最關鍵的錯誤訊息行；stack 策略以 frame 為邊界、永不切半、非 frame 訊號行恆保留。
+//
+// 與 log/diff/search 對稱、全用 byte 級判別（skip 0x20/0x09 前綴後比對 `File "` / `at `），
+// 不走 trim —— 避開 Python unicode 空白與 Rust trim 分岔。frame 切段與丟棄純靠 index 數學
+// （保序逐行掃），無雜湊順序依賴 → Py/Rs 逐字節一致。
+//
+// 收存點不對稱承襲 M11–M15：Rust squeeze 純函式回 Option、put 在 compress_block 呼叫端。
+// 註冊排在 LOG 之後、TRUNCATE 之前：既有 fixture 由前面策略先接走，stack 只接純 stack trace。
+
+const MIN_STACK_LINES: usize = 8;
+const MIN_STACK_FRAMES: usize = 10;
+const STACK_KEEP_HEAD: usize = 3;
+const STACK_KEEP_TAIL: usize = 3;
+const STACK_DROP_RATIO: f64 = 0.3;
+
+/// 只去除前綴 ASCII 空白（0x20/0x09），與 Python `_strip_ascii_ws` 逐字節對齊。
+fn strip_ascii_ws(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    &line[i..]
+}
+
+/// frame 標頭判斷：去 ASCII 前綴空白後，像 Python `File "..."` 或 Java/JS `at ...(...)`。
+/// `at ` 額外要求含 `(` —— 真 frame 帶 `(File:line)`，藉此擋掉 "at the store" 這類 prose。
+fn is_frame_header(line: &str) -> bool {
+    let s = strip_ascii_ws(line);
+    if s.starts_with("File \"") {
+        return true;
+    }
+    s.starts_with("at ") && s.contains('(')
+}
+
+/// frame 續行：以 ASCII 空白（空格/tab）起頭的非空行（如 Python frame 下的程式碼行）。
+fn is_continuation(line: &str) -> bool {
+    matches!(line.as_bytes().first(), Some(b' ') | Some(b'\t'))
+}
+
+/// 把行序列切成 frame 區段，回各 frame 的 (start, end_exclusive) 行索引範圍。
+/// frame = 標頭行 + 其後續行（縮排、非標頭），直到下一個標頭行或非續行為止。
+fn segment_frames(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut frames: Vec<(usize, usize)> = Vec::new();
+    let n = lines.len();
+    let mut i = 0;
+    while i < n {
+        if is_frame_header(lines[i]) {
+            let start = i;
+            i += 1;
+            while i < n && !is_frame_header(lines[i]) && is_continuation(lines[i]) {
+                i += 1;
+            }
+            frames.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    frames
+}
+
+/// 回「應丟棄」的行 drop flags：中段 frame（保前 HEAD + 後 TAIL）的所有行。
+/// frame 數不足 → 全 false。純 index 數學、保序 → 確定性、parity 友善。
+fn stack_drop_flags(lines: &[&str]) -> Vec<bool> {
+    let mut flags = vec![false; lines.len()];
+    let frames = segment_frames(lines);
+    if frames.len() < MIN_STACK_FRAMES {
+        return flags;
+    }
+    let last = frames.len() - STACK_KEEP_TAIL;
+    for &(start, end) in &frames[STACK_KEEP_HEAD..last] {
+        for f in flags.iter_mut().take(end).skip(start) {
+            *f = true;
+        }
+    }
+    flags
+}
+
+/// 嗅探：夠多行、frame 數足、且中段可丟行佔比夠高才認領；否則讓 truncate 兜底。
+fn stack_applies(text: &str) -> bool {
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.len() < MIN_STACK_LINES {
+        return false;
+    }
+    let dropped = stack_drop_flags(&lines).iter().filter(|d| **d).count();
+    if dropped == 0 {
+        return false;
+    }
+    (dropped as f64 / lines.len() as f64) >= STACK_DROP_RATIO
+}
+
+/// 保前 HEAD + 後 TAIL 個 frame、丟中段 frame，非 frame 行全留，丟棄處塞單一 marker。
+/// 沒可丟 frame 回 `None`（呼叫端保留原文、不 put）。marker 含丟掉 frame 數 + content_key。
+fn stack_squeeze(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let flags = stack_drop_flags(&lines);
+    if !flags.iter().any(|d| *d) {
+        return None;
+    }
+    let frames = segment_frames(&lines);
+    let dropped_frames = frames.len() - STACK_KEEP_HEAD - STACK_KEEP_TAIL;
+    let marker = format!(
+        "[... headroom-lite dropped {dropped_frames} stack frames | sha256:{} ...]",
+        content_key(text)
+    );
+    let mut parts: Vec<&str> = Vec::new();
+    let mut marker_emitted = false;
+    for (line, drop) in lines.iter().zip(&flags) {
+        if *drop {
+            if !marker_emitted {
+                parts.push(&marker); // 中段第一個丟棄處塞一次 marker，其餘丟棄行省略
+                marker_emitted = true;
+            }
+            continue;
+        }
+        parts.push(line);
+    }
+    Some(parts.join("\n"))
+}
+
+/// stacktrace 排在 log 之後、truncate 之前：純 stack trace（無 INFO/DEBUG 噪音）不被 log
+/// 認領 → 落到此；既有 log/diff/search/json fixture 已由前面策略接走，stack 不回歸它們。
+pub const STACKTRACE: Strategy = Strategy {
+    name: "stacktrace",
+    applies: stack_applies,
+    squeeze: stack_squeeze,
+};
+
+/// 策略註冊表：按優先序排列。json/diff/search/log/stacktrace 先嗅探，不命中才落到 truncate 兜底。
+pub const STRATEGIES: &[Strategy] = &[JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE];
 
 /// dispatcher：選第一個 applies 命中的策略來壓，命中即停。預設用模組級註冊表。
 pub fn squeeze_text(text: &str) -> Option<String> {

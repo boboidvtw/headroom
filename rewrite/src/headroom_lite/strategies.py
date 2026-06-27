@@ -437,8 +437,140 @@ def _json_squeeze(text: str, store=None) -> str:
 # 真 JSON array 的 tool_result 本就該由此壓。
 JSON = Strategy("json", _json_applies, _json_squeeze)
 
-# 策略註冊表：按優先序排列。json/diff/search/log 先嗅探，不命中才落到 truncate 兜底。
-STRATEGIES: tuple[Strategy, ...] = (JSON, DIFF, SEARCH, LOG, TRUNCATE)
+
+# ── M16 — stack trace 內容感知策略（第五片「嗅探→壓」內容策略）──
+#
+# 對象：遞迴爆炸 / 深框架的 stack trace（Python `File "..."`、Java/JS `at ...(`）。噪音 =
+# 中段大量重複或框架內部 frame；訊號 = 頂層 frame（錯在哪）、底層 frame（根因/進入點）、
+# 與所有非 frame 行（`Traceback` 標頭、最終 `XxxError: msg`、chained-exception 分隔線）。
+# 壓法：把 trace 切成 frame，保前 STACK_KEEP_HEAD + 後 STACK_KEEP_TAIL 個 frame、丟中段
+# frame（連同其續行），**所有非 frame 行一律保留**，丟棄處塞一個 marker。
+#
+# 與盲目頭尾截斷的差別：truncate 以「行」為單位、會切半個 frame（把 `File "..."` 與其
+# 程式碼續行拆開），且若 trace 尾端有多行非 frame 訊息，truncate 的 tail 視窗可能擠掉最關鍵
+# 的 `XxxError: msg`。stack 策略以 frame 為邊界、永不切半、且非 frame 訊號行恆保留。
+#
+# 與 log/diff/search 對稱、全用 byte 級判別（skip 0x20/0x09 前綴後比對 `File "` / `at `），
+# 不走 `str.strip()` —— 避開 Python unicode 空白與 Rust `trim` 分岔。frame 切段與丟棄純靠
+# index 數學（保序逐行掃 + frame 區段），無雜湊順序依賴 → Py/Rs 逐字節一致。
+#
+# 註冊排在 LOG 之後、TRUNCATE 之前：既有 log/diff/search/json fixture 由前面策略先接走，
+# stack 只接「沒有其他策略認領、否則會落盲截斷」的純 stack trace → 零回歸。
+
+MIN_STACK_LINES = 8  # 太少行不值得當 stack trace 處理
+MIN_STACK_FRAMES = 10  # frame 數下限（HEAD3+TAIL3+至少丟 4）
+STACK_KEEP_HEAD = 3  # 保留頂層 frame 數
+STACK_KEEP_TAIL = 3  # 保留底層 frame 數
+STACK_DROP_RATIO = 0.3  # 可丟行佔比下限 —— 低於此交給 truncate
+
+
+def _strip_ascii_ws(line: str) -> str:
+    """只去除前綴的 ASCII 空白（0x20 空格 / 0x09 tab）—— 與 Rust 逐字節對齊，
+    不用 str.lstrip()（認 unicode 空白，會與 Rust 分岔）。"""
+    i = 0
+    while i < len(line) and line[i] in " \t":
+        i += 1
+    return line[i:]
+
+
+def _is_frame_header(line: str) -> bool:
+    """frame 標頭判斷：去 ASCII 前綴空白後，像 Python `File "..."` 或 Java/JS `at ...(...)`。
+
+    `at ` 額外要求該行含 `(` —— 真 frame 帶 `(File:line)`，藉此擋掉 "at the store" 這類 prose。
+    """
+    s = _strip_ascii_ws(line)
+    if s.startswith('File "'):
+        return True
+    if s.startswith("at ") and "(" in s:
+        return True
+    return False
+
+
+def _is_continuation(line: str) -> bool:
+    """frame 續行判斷：以 ASCII 空白（空格/tab）起頭的非空行（如 Python frame 下的程式碼行）。"""
+    return len(line) > 0 and line[0] in " \t"
+
+
+def _segment_frames(lines: list[str]) -> list[tuple[int, int]]:
+    """把行序列切成 frame 區段，回各 frame 的 (start, end_exclusive) 行索引範圍。
+
+    frame = 一個標頭行 + 其後的續行（縮排、非標頭），直到下一個標頭行或非續行為止。
+    非 frame 行（標頭前的 preamble、最終錯誤訊息、chained-exception 分隔）不納入任何 frame。
+    """
+    frames: list[tuple[int, int]] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if _is_frame_header(lines[i]):
+            start = i
+            i += 1
+            while i < n and not _is_frame_header(lines[i]) and _is_continuation(lines[i]):
+                i += 1
+            frames.append((start, i))
+        else:
+            i += 1
+    return frames
+
+
+def _stack_dropped_lines(lines: list[str]) -> set[int]:
+    """回「應丟棄」的行索引集合：中段 frame（保前 HEAD + 後 TAIL 個 frame）的所有行。
+
+    frame 數不足 → 空集合（不丟）。純 index 數學、保序 → 確定性、parity 友善。
+    """
+    frames = _segment_frames(lines)
+    if len(frames) < MIN_STACK_FRAMES:
+        return set()
+    drop: set[int] = set()
+    for fi in range(STACK_KEEP_HEAD, len(frames) - STACK_KEEP_TAIL):
+        start, end = frames[fi]
+        drop.update(range(start, end))
+    return drop
+
+
+def _stacktrace_applies(text: str) -> bool:
+    """嗅探：夠多行、frame 數足、且中段可丟行佔比夠高才認領；否則讓 truncate 兜底。"""
+    lines = text.split("\n")
+    if len(lines) < MIN_STACK_LINES:
+        return False
+    drop = _stack_dropped_lines(lines)
+    if not drop:
+        return False
+    return len(drop) / len(lines) >= STACK_DROP_RATIO
+
+
+def _stacktrace_squeeze(text: str, store=None) -> str:
+    """保前 HEAD + 後 TAIL 個 frame、丟中段 frame，非 frame 行全留，丟棄處塞單一 marker。
+
+    沒可丟 frame → 原文回、絕不 put（神聖時機契約）。marker 含「丟掉 frame 數 + 原文
+    content_key」—— key 是 CCR 取回鑰匙，也是確定性證明書。
+    """
+    lines = text.split("\n")
+    drop = _stack_dropped_lines(lines)
+    if not drop:
+        return text  # 沒得丟 → 原文回，不 put
+    frames = _segment_frames(lines)
+    dropped_frames = len(frames) - STACK_KEEP_HEAD - STACK_KEEP_TAIL
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    digest = content_key(text)
+    marker = f"[... headroom-lite dropped {dropped_frames} stack frames | sha256:{digest} ...]"
+    out: list[str] = []
+    marker_emitted = False
+    for idx, line in enumerate(lines):
+        if idx in drop:
+            if not marker_emitted:
+                out.append(marker)  # 中段第一個丟棄處塞一次 marker，其餘丟棄行省略
+                marker_emitted = True
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+# stacktrace 排在 log 之後、truncate 之前：純 stack trace（無 INFO/DEBUG 噪音）不被 log
+# 認領 → 落到此；既有 log/diff/search/json fixture 已由前面策略接走，stack 不回歸它們。
+STACKTRACE = Strategy("stacktrace", _stacktrace_applies, _stacktrace_squeeze)
+
+# 策略註冊表：按優先序排列。json/diff/search/log/stacktrace 先嗅探，不命中才落到 truncate 兜底。
+STRATEGIES: tuple[Strategy, ...] = (JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE)
 
 
 def squeeze_text(text: str, store=None, strategies: tuple[Strategy, ...] = STRATEGIES) -> str:

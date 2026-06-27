@@ -448,6 +448,119 @@ def test_json_stores_original_before_squeezing():
     assert store.puts == [text]
 
 
+# ── M16：stack trace 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import (
+    STACKTRACE,
+    _is_frame_header,
+    _stacktrace_squeeze,
+)
+
+
+def _py_recursion_trace(frames: int = 15) -> str:
+    """Python RecursionError traceback：N 個逐字相同的 2 行 frame（典型遞迴爆炸）。"""
+    head = "Traceback (most recent call last):"
+    body = "\n".join(
+        '  File "/app/rec.py", line 3, in foo\n    return foo(n - 1)'
+        for _ in range(frames)
+    )
+    tail = "RecursionError: maximum recursion depth exceeded"
+    return f"{head}\n{body}\n{tail}"
+
+
+def _java_trace(frames: int = 15) -> str:
+    """Java 風格單行 frame：`\\tat pkg.Class.method(File.java:line)`。"""
+    head = "Exception in thread \"main\" java.lang.StackOverflowError"
+    body = "\n".join(f"\tat com.example.App.foo(App.java:{10 + i})" for i in range(frames))
+    return f"{head}\n{body}"
+
+
+def test_stack_is_frame_header_python_and_java():
+    assert _is_frame_header('  File "/app/x.py", line 3, in foo') is True
+    assert _is_frame_header("\tat com.example.App.foo(App.java:10)") is True
+    assert _is_frame_header("    at foo (/app/x.js:1:1)") is True
+
+
+def test_stack_frame_header_rejects_prose():
+    # `at ` 開頭但無括號 → 非 frame（擋掉 "at the store" 這類 prose）。
+    assert _is_frame_header("at the store we bought milk") is False
+    assert _is_frame_header("RecursionError: boom") is False
+    assert _is_frame_header("Traceback (most recent call last):") is False
+
+
+def test_stack_applies_on_recursion_trace():
+    assert STACKTRACE.applies(_py_recursion_trace(15)) is True
+    assert STACKTRACE.applies(_java_trace(15)) is True
+
+
+def test_stack_applies_false_on_few_frames():
+    # 少於 MIN_STACK_FRAMES → 不認領，交 truncate 兜底。
+    assert STACKTRACE.applies(_py_recursion_trace(4)) is False
+
+
+def test_stack_applies_false_on_prose():
+    prose = "\n".join(f"at the park we saw {i} ducks today" for i in range(30))
+    assert STACKTRACE.applies(prose) is False
+
+
+def test_stack_squeeze_keeps_head_tail_frames_and_messages():
+    from headroom_lite.strategies import STACK_KEEP_HEAD, STACK_KEEP_TAIL
+    text = _py_recursion_trace(15)
+    out = _stacktrace_squeeze(text)
+    lines = out.split("\n")
+    # 非 frame 訊號行全保留：標頭 + 最終錯誤行。
+    assert lines[0] == "Traceback (most recent call last):"
+    assert lines[-1] == "RecursionError: maximum recursion depth exceeded"
+    # 頭 frame 保留（第一個 File 行）。
+    assert '  File "/app/rec.py", line 3, in foo' in lines[1]
+    # 中段 frame 收斂成單一 marker。
+    assert any("dropped" in line and "stack frames" in line for line in lines)
+    # 保留的 frame 數 = head + tail（每 frame 2 行）。
+    file_lines = [line for line in lines if line.lstrip().startswith('File "')]
+    assert len(file_lines) == STACK_KEEP_HEAD + STACK_KEEP_TAIL
+
+
+def test_stack_marker_has_count_and_key():
+    text = _py_recursion_trace(15)
+    out = squeeze_text(text)
+    assert f"sha256:{content_key(text)}" in out
+    assert "dropped 9 stack frames" in out  # 15 - 3 - 3 = 9
+
+
+def test_stack_deterministic():
+    text = _py_recursion_trace(15)
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_stack_stores_original_before_squeezing():
+    store = _SpyStore()
+    text = _py_recursion_trace(15)
+    squeeze_text(text, store=store)
+    assert store.puts == [text]
+
+
+def test_stack_no_drop_returns_text_without_put():
+    store = _SpyStore()
+    text = _py_recursion_trace(4)  # 太少 frame，不認領
+    out = STACKTRACE.squeeze(text, store=store)
+    assert out == text
+    assert store.puts == []
+
+
+def test_stack_does_not_swallow_logs():
+    # 既有 noisy log（有 INFO/DEBUG 噪音）必須由 LOG 接走，不被 STACKTRACE 搶。
+    log = "\n".join(
+        [f"2026-06-27 INFO heartbeat {i}" for i in range(10)]
+        + [f"2026-06-27 DEBUG poll {i}" for i in range(10)]
+        + ["2026-06-27 ERROR boom"]
+    )
+    assert STACKTRACE.applies(log) is False
+
+
+def test_stack_registered_after_log_before_truncate():
+    names = [s.name for s in STRATEGIES]
+    assert names.index("log") < names.index("stacktrace") < names.index("truncate")
+
+
 def test_json_no_compress_returns_text_without_put():
     # 防禦性：array 太小壓不動 → 原文回、絕不 put。
     store = _SpyStore()

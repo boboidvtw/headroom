@@ -9,8 +9,8 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, JSON, LOG, SEARCH, STRATEGIES,
-    TAIL_LINES, TRUNCATE,
+    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, JSON, LOG, SEARCH, STACKTRACE,
+    STRATEGIES, TAIL_LINES, TRUNCATE,
 };
 
 fn long_text() -> String {
@@ -488,5 +488,95 @@ fn json_registered_first() {
 #[test]
 fn json_deterministic() {
     let text = json_array(20);
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
+
+// ── M16：stack trace 內容感知策略（對齊 Python test_strategies.py）──
+
+/// Python RecursionError traceback：N 個逐字相同的 2 行 frame（典型遞迴爆炸）。
+fn py_recursion_trace(frames: usize) -> String {
+    let head = "Traceback (most recent call last):";
+    let body: Vec<&str> = (0..frames)
+        .map(|_| "  File \"/app/rec.py\", line 3, in foo\n    return foo(n - 1)")
+        .collect();
+    let tail = "RecursionError: maximum recursion depth exceeded";
+    format!("{head}\n{}\n{tail}", body.join("\n"))
+}
+
+#[test]
+fn stack_applies_on_recursion_trace() {
+    assert!((STACKTRACE.applies)(&py_recursion_trace(15)));
+}
+
+#[test]
+fn stack_applies_false_on_few_frames() {
+    // 少於 MIN_STACK_FRAMES → 不認領，交 truncate 兜底。
+    assert!(!(STACKTRACE.applies)(&py_recursion_trace(4)));
+}
+
+#[test]
+fn stack_applies_false_on_prose() {
+    let prose = (0..30)
+        .map(|i| format!("at the park we saw {i} ducks today"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(STACKTRACE.applies)(&prose));
+}
+
+#[test]
+fn stack_squeeze_keeps_head_tail_and_messages() {
+    let text = py_recursion_trace(15);
+    let out = (STACKTRACE.squeeze)(&text).expect("recursion trace 該壓");
+    let lines: Vec<&str> = out.split('\n').collect();
+    // 非 frame 訊號行全保留：標頭 + 最終錯誤行。
+    assert_eq!(lines[0], "Traceback (most recent call last):");
+    assert_eq!(
+        *lines.last().unwrap(),
+        "RecursionError: maximum recursion depth exceeded"
+    );
+    // 保留的 File 行數 = head + tail（3+3）。
+    let file_lines = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with("File \""))
+        .count();
+    assert_eq!(file_lines, 6);
+    assert!(out.contains("stack frames"));
+}
+
+#[test]
+fn stack_marker_has_count_and_key() {
+    let text = py_recursion_trace(15);
+    let out = squeeze_text(&text).expect("recursion trace 該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&text))));
+    assert!(out.contains("dropped 9 stack frames")); // 15 - 3 - 3 = 9
+}
+
+#[test]
+fn stack_no_drop_returns_none() {
+    // 防禦性：squeeze 直呼但 frame 太少 → None（呼叫端保留原文、不 put）。
+    assert_eq!((STACKTRACE.squeeze)(&py_recursion_trace(4)), None);
+}
+
+#[test]
+fn stack_does_not_swallow_logs() {
+    // 關鍵不回歸：噪音 log 仍走 log → stacktrace 不吃。
+    let log = noisy_log();
+    assert!(!(STACKTRACE.applies)(&log));
+    let out = squeeze_text(&log).expect("log 該壓");
+    assert!(out.contains("log lines")); // 仍是 log 策略的標記
+}
+
+#[test]
+fn stack_registered_after_log_before_truncate() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let l = names.iter().position(|&n| n == "log").unwrap();
+    let s = names.iter().position(|&n| n == "stacktrace").unwrap();
+    let t = names.iter().position(|&n| n == "truncate").unwrap();
+    assert!(l < s && s < t, "順序須為 log < stacktrace < truncate");
+}
+
+#[test]
+fn stack_deterministic() {
+    let text = py_recursion_trace(15);
     assert_eq!(squeeze_text(&text), squeeze_text(&text));
 }
