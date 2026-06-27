@@ -44,6 +44,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M13 | _local_ | second content-aware strategy: **diff compression** | classify unified/git-diff lines by role, drop unchanged context (` ` space-prefixed), keep every structural line: hunk headers (`@@`), file headers (`diff`/`index`/`---`/`+++`), and all `+`/`-` changes; marker = `dropped N diff context lines` + `content_key`. Same win as log on buried signal: changes scattered in a large context block — truncate keeps only head+tail and loses the middle ones, diff sniffs every line and keeps each change (hunk headers already encode line ranges; CCR store holds the original for reversal). Claims only with a hunk header present (so markdown `+`/`-` bullets aren't mistaken for a diff) and context ≥ 30% (else falls through to truncate). Registered **before** log — a `@@`-bearing diff's structure outranks log severity classification (existing logs have no hunk header, so they don't collide). Pure ASCII byte prefixes (no `strip`/`trim` unicode divergence), Py/Rs byte-identical. New `07_diff.json` fixture: 7227→**1857** bytes through the full pipeline, cross-language byte-for-byte |
 | M14 | _local_ | third content-aware strategy: **search compression** | grep/rg `file:lineno:content` output — cap matches per file (keep first 3, drop the rest), marker = `dropped N search result lines` + `content_key`. The teaching landmine: detecting a match line by "`:`-split, second field all digits" also matches log timestamps (`10:30:45` is literally `field:digits:field`) — so search would cannibalize logs. Fix: require the file_key (before the first `:`) to contain a `/`; real `grep -rn pat .` always carries a path (`./src/foo.py:12:`), a timestamp prefix (`2026-06-20T10`) never does — a pure ASCII byte check, identical across languages. Registered `(DIFF, SEARCH, LOG, TRUNCATE)`: grep-over-logs routes to search, but existing logs have no `/`-bearing `file:line:` lines so they still route to log (no M12 regression). Determinism via in-order scan + per-file counts (HashMap looked up, never iterated → no hash-order dependence). New `08_search.json` fixture: 4289→**1702** bytes, byte-for-byte |
 | M15 | _local_ | fourth content-aware strategy: **json compression** | find the largest JSON array, keep first 5 + last 2 elements, splice a marker string element in between (result stays valid JSON), copy everything outside the array verbatim; marker = `dropped N array elements` + `content_key`. The headline lesson is the parity insight: the obvious approach — parse, truncate, re-serialize — hits the number-reserialization landmine (`json.dumps` normalizes `1.10`→`1.1`, but Rust's `arbitrary_precision` keeps `1.10` → divergence). The fix is to **never re-serialize any value**: a byte-level structural scan (tracking string literals and nesting depth) records element byte-spans, and kept elements are copied as raw byte slices — only the structural chars (`[` `,` `]`) and the marker are newly written, all ASCII constants. So Python and Rust can't diverge on values. Determinism: tie-break is most-elements-then-smallest-start (Python `max` keeps first on ties, Rust `max_by_key` keeps last, so both use explicit "strictly-greater replaces"). Guarded to genuine JSON documents (first non-whitespace byte is `[`/`{`) so bracket-containing prose/logs aren't mistaken for JSON. Registered first. New `09_json.json` fixture deliberately includes `1.10` and `1e10`: 2959→**1651** bytes, byte-for-byte across languages with the tricky numbers preserved verbatim |
+| M16 | _local_ | fifth content-aware strategy: **stack trace compression** | segment a stack trace into frames (Python `File "..."`, Java/JS `at ...(`), keep the first 3 + last 3 frames, drop the middle frames (with their continuation lines), keep **every non-frame line** (the `Traceback` header, the final `XxxError: msg`, chained-exception separators); marker = `dropped N stack frames` + `content_key`. Beats blind truncation on frame integrity: truncate cuts at a line boundary and can split a `File "..."` header from its code line, and a multi-line trailing message can push the crucial error line out of the tail window — the frame-aware strategy never splits a frame and always keeps the message lines. A frame header is detected byte-level (strip leading `0x20`/`0x09`, then `File "` or `at ` + `(`) — the `(` requirement rejects prose like "at the store". Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE)` — just before TRUNCATE, so every existing fixture is claimed by an earlier strategy first (zero regression by construction; a pure stack trace has no `INFO/DEBUG` noise so log never claims it). Determinism via in-order frame segmentation + index math (no hash-order dependence), Py/Rs byte-identical. New `10_stacktrace.json` fixture (30-frame recursion trace): 2906→**1386** bytes through the full pipeline, cross-language byte-for-byte |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -229,16 +230,57 @@ M15 接上**第四片內容感知策略**：json 壓縮。它找出元素最多�
 `09_json.json` fixture 刻意把 `1.10` 與 `1e10` 混進 array：壓 2959→1651 bytes、兩語言
 逐字節一致、那些數字原樣保留——正是「照抄而不重序列化」拆掉地雷的證明。
 
+## Notes — M16 (2026-06-27)
+
+M16 added the **fifth content-aware strategy**: stack trace compression. It segments
+a trace into frames — a frame header is a line that, after stripping leading ASCII
+whitespace, begins with `File "` (Python) or `at ` + a `(` (Java/JS); the `(`
+requirement rejects prose like "at the store" — and a frame includes the header plus
+its indented continuation lines. The strategy keeps the first 3 and last 3 frames,
+drops the middle frames, and keeps **every non-frame line**: the `Traceback` header,
+the trailing `XxxError: message`, and any chained-exception separators are all signal.
+The marker (`dropped N stack frames` + `content_key`) is emitted once at the first
+dropped line; the rest are simply omitted. The win over blind truncation is frame
+integrity: truncate cuts at a line boundary and can split a `File "..."` header from
+its code line, and when a trace ends with several non-frame message lines the tail
+window can push the crucial error line out — the frame-aware strategy never splits a
+frame and the error message always survives. It registers `(JSON, DIFF, SEARCH, LOG,
+STACKTRACE, TRUNCATE)`, just before the catch-all, so every existing fixture is
+claimed by an earlier strategy first — zero regression by construction (a pure stack
+trace carries no `INFO/DEBUG` noise, so log never claims it). Determinism comes from
+in-order frame segmentation and pure index math (no hash-order dependence), and all
+classification is byte-level (no `strip`/`trim` unicode divergence), so Python and
+Rust stay byte-identical. The new `10_stacktrace.json` fixture — a 30-frame Python
+recursion trace — compresses 2906→1386 bytes through the full pipeline, byte-for-byte
+across both languages.
+
+## Notes — M16（2026-06-27）
+
+M16 接上**第五片內容感知策略**：stack trace 壓縮。它把 trace 切成 frame——frame 標頭
+是「去掉前綴 ASCII 空白後，以 `File "`（Python）或 `at ` + 含 `(`（Java/JS）起頭」的行，
+那個 `(` 的要求擋掉 "at the store" 這類 prose——一個 frame 含標頭行加其縮排續行。策略
+保留前 3 + 後 3 個 frame、丟中段 frame，並保留**所有非 frame 行**：`Traceback` 標頭、
+結尾的 `XxxError: 訊息`、以及 chained-exception 分隔線都是訊號。marker（`dropped N
+stack frames` + `content_key`）只在第一個丟棄處塞一次，其餘丟棄行直接省略。勝過盲截斷
+的點是 frame 完整性：truncate 在行邊界切，可能把 `File "..."` 標頭與其程式碼續行拆開；
+而 trace 尾端有多行非 frame 訊息時，tail 視窗可能把最關鍵的錯誤行擠出去——frame 感知
+策略永不切半個 frame、錯誤訊息恆保留。註冊 `(JSON, DIFF, SEARCH, LOG, STACKTRACE,
+TRUNCATE)`、排在 catch-all 前，所以每個既有 fixture 都被前面的策略先接走——靠註冊順序
+保證零回歸（純 stack trace 無 `INFO/DEBUG` 噪音，log 不會認領）。確定性來自保序 frame
+切段 + 純 index 數學（無雜湊順序依賴），所有判別皆 byte 級（無 `strip`/`trim` unicode
+分岔），故 Python 與 Rust 逐字節一致。新增的 `10_stacktrace.json` fixture——30 個 frame
+的 Python 遞迴 trace——走完整 pipeline 壓 2906→1386 bytes、兩語言逐字節一致。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 94 tests
+cd rewrite && uv run pytest -q              # 106 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 101 tests
+cd rewrite/rust-lite && cargo test          # 110 tests
 
-# Cross-language parity gate / 跨語言 parity gate（9 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（10 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
