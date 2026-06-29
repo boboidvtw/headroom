@@ -683,3 +683,102 @@ def test_csv_does_not_swallow_other_strategies():
 def test_csv_registered_after_stacktrace_before_truncate():
     names = [s.name for s in STRATEGIES]
     assert names.index("stacktrace") < names.index("csv") < names.index("truncate")
+
+
+# ── M18：Markdown table 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import (  # noqa: E402
+    MARKDOWN,
+    MD_KEEP_HEAD,
+    MD_KEEP_TAIL,
+    _md_squeeze,
+)
+
+
+def _md_table(rows: int = 40) -> str:
+    """GitHub-flavored markdown 表格：表頭 + 分隔列 + N 資料列（皆 5 個 `|`）。"""
+    header = "| id | name | department | salary |"
+    sep = "| -- | ---- | ---------- | ------ |"
+    body = "\n".join(f"| {i} | user{i} | engineering | {50000 + i} |" for i in range(rows))
+    return f"{header}\n{sep}\n{body}"
+
+
+def test_md_applies_on_markdown_table():
+    assert MARKDOWN.applies(_md_table(40)) is True
+
+
+def test_md_applies_false_on_few_droppable_rows():
+    # 8 資料列：8 - 3 - 2 = 3 可丟 < MIN_MD_DROP(4) → 不認領。
+    assert MARKDOWN.applies(_md_table(8)) is False
+
+
+def test_md_applies_false_without_separator_row():
+    # 第二行不是分隔列（沒有 dash）→ 不是 markdown 表格，落 truncate 兜底。
+    rows = [f"| {i} | user{i} | eng |" for i in range(40)]
+    text = "| id | name | dept |\n" + "\n".join(rows)  # 缺 |---| 分隔列
+    assert MARKDOWN.applies(text) is False
+
+
+def test_md_applies_false_on_inconsistent_pipes():
+    # 每行 `|` 數不一致（散文夾雜 pipe）→「每行同數」嗅探擋下。
+    text = "\n".join(["| a | b |", "| -- | -- |"] + [f"line {i} | one pipe" for i in range(40)])
+    assert MARKDOWN.applies(text) is False
+
+
+def test_md_applies_false_on_prose():
+    prose = "\n".join(f"the quick brown fox jumped {i}" for i in range(40))
+    assert MARKDOWN.applies(prose) is False
+
+
+def test_md_squeeze_keeps_header_separator_head_tail():
+    text = _md_table(40)
+    out = _md_squeeze(text)
+    lines = out.split("\n")
+    assert lines[0] == "| id | name | department | salary |"  # 表頭恆保留
+    assert lines[1] == "| -- | ---- | ---------- | ------ |"  # 分隔列恆保留（結構訊號）
+    assert lines[2] == "| 0 | user0 | engineering | 50000 |"  # 第一筆資料列
+    assert lines[-1] == "| 39 | user39 | engineering | 50039 |"  # 最後一筆資料列
+    assert any("dropped" in line and "markdown table rows" in line for line in lines)
+    # 輸出行數 = 表頭 + 分隔列 + head + marker + tail。
+    assert len(lines) == 1 + 1 + MD_KEEP_HEAD + 1 + MD_KEEP_TAIL
+
+
+def test_md_marker_has_count_and_key():
+    text = _md_table(40)
+    out = squeeze_text(text)
+    assert f"sha256:{content_key(text)}" in out
+    assert "dropped 35 markdown table rows" in out  # 40 - 3 - 2 = 35
+
+
+def test_md_deterministic():
+    text = _md_table(40)
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_md_stores_original_before_squeezing():
+    store = _SpyStore()
+    text = _md_table(40)
+    squeeze_text(text, store=store)
+    assert store.puts == [text]
+
+
+def test_md_no_compress_returns_text_without_put():
+    # 可丟列數不足 → 原文回、絕不 put（神聖時機契約）。
+    store = _SpyStore()
+    text = _md_table(8)
+    assert _md_squeeze(text, store) == text
+    assert store.puts == []
+
+
+def test_md_does_not_swallow_other_strategies():
+    # 不回歸：log/diff/search/csv 由各自策略接走，markdown 不搶（它們非 pipe 表格）。
+    assert MARKDOWN.applies(_noisy_log()) is False
+    assert MARKDOWN.applies(_diff()) is False
+    assert MARKDOWN.applies(_search()) is False
+    assert MARKDOWN.applies(_csv_table(40)) is False  # 逗號表格無 pipe → markdown 不認領
+
+
+def test_md_registered_before_csv():
+    # markdown 比 csv 更專一（需分隔列 + pipe 一致）→ 排 csv 前，兩者其實互斥（pipe vs 逗號）。
+    names = [s.name for s in STRATEGIES]
+    assert names.index("stacktrace") < names.index("markdown") < names.index("csv")
+    assert names.index("csv") < names.index("truncate")

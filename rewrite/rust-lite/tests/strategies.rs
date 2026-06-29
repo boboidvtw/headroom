@@ -9,8 +9,8 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, CSV, DIFF, HEAD_LINES, JSON, LOG, SEARCH, STACKTRACE,
-    STRATEGIES, TAIL_LINES, TRUNCATE,
+    squeeze_text, squeeze_text_with, Strategy, CSV, DIFF, HEAD_LINES, JSON, LOG, MARKDOWN, SEARCH,
+    STACKTRACE, STRATEGIES, TAIL_LINES, TRUNCATE,
 };
 
 fn long_text() -> String {
@@ -684,5 +684,106 @@ fn csv_registered_after_stacktrace_before_truncate() {
 #[test]
 fn csv_deterministic() {
     let text = csv_table(40);
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
+
+// ── M18：Markdown table 內容感知策略（對齊 Python test_strategies.py）──
+
+/// GitHub-flavored markdown 表格：表頭 + 分隔列 + N 資料列（皆 5 個 `|`）。
+fn md_table(rows: usize) -> String {
+    let header = "| id | name | department | salary |";
+    let sep = "| -- | ---- | ---------- | ------ |";
+    let body: Vec<String> = (0..rows)
+        .map(|i| format!("| {i} | user{i} | engineering | {} |", 50000 + i))
+        .collect();
+    format!("{header}\n{sep}\n{}", body.join("\n"))
+}
+
+#[test]
+fn md_applies_on_markdown_table() {
+    assert!((MARKDOWN.applies)(&md_table(40)));
+}
+
+#[test]
+fn md_applies_false_on_few_droppable_rows() {
+    // 8 資料列：8 - 3 - 2 = 3 可丟 < MIN_MD_DROP(4) → 不認領。
+    assert!(!(MARKDOWN.applies)(&md_table(8)));
+}
+
+#[test]
+fn md_applies_false_without_separator_row() {
+    // 第二行不是分隔列（沒有 dash）→ 不是 markdown 表格。
+    let mut lines = vec!["| id | name | dept |".to_string()];
+    lines.extend((0..40).map(|i| format!("| {i} | user{i} | eng |")));
+    assert!(!(MARKDOWN.applies)(&lines.join("\n")));
+}
+
+#[test]
+fn md_applies_false_on_inconsistent_pipes() {
+    // 每行 `|` 數不一致 → 「每行同數」嗅探擋下。
+    let mut lines = vec!["| a | b |".to_string(), "| -- | -- |".to_string()];
+    lines.extend((0..40).map(|i| format!("line {i} | one pipe")));
+    assert!(!(MARKDOWN.applies)(&lines.join("\n")));
+}
+
+#[test]
+fn md_applies_false_on_prose() {
+    let prose = (0..40)
+        .map(|i| format!("the quick brown fox jumped {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(MARKDOWN.applies)(&prose));
+}
+
+#[test]
+fn md_squeeze_keeps_header_separator_head_tail() {
+    let text = md_table(40);
+    let out = (MARKDOWN.squeeze)(&text).expect("markdown 表格該壓");
+    let lines: Vec<&str> = out.split('\n').collect();
+    assert_eq!(lines[0], "| id | name | department | salary |"); // 表頭恆保留
+    assert_eq!(lines[1], "| -- | ---- | ---------- | ------ |"); // 分隔列恆保留
+    assert_eq!(lines[2], "| 0 | user0 | engineering | 50000 |"); // 第一筆資料列
+    assert_eq!(*lines.last().unwrap(), "| 39 | user39 | engineering | 50039 |"); // 最後一筆
+    assert!(out.contains("markdown table rows"));
+    // 輸出行數 = 表頭 + 分隔列 + head(3) + marker + tail(2) = 8。
+    assert_eq!(lines.len(), 1 + 1 + 3 + 1 + 2);
+}
+
+#[test]
+fn md_marker_has_count_and_key() {
+    let text = md_table(40);
+    let out = squeeze_text(&text).expect("markdown 表格該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&text))));
+    assert!(out.contains("dropped 35 markdown table rows")); // 40 - 3 - 2 = 35
+}
+
+#[test]
+fn md_no_drop_returns_none() {
+    // 防禦性：squeeze 直呼但可丟列數不足 → None（呼叫端保留原文、不 put）。
+    assert_eq!((MARKDOWN.squeeze)(&md_table(8)), None);
+}
+
+#[test]
+fn md_does_not_swallow_other_strategies() {
+    // 不回歸：log/diff/search/csv 非 pipe 表格 → markdown 不搶。
+    assert!(!(MARKDOWN.applies)(&noisy_log()));
+    assert!(!(MARKDOWN.applies)(&diff()));
+    assert!(!(MARKDOWN.applies)(&search_default()));
+    assert!(!(MARKDOWN.applies)(&csv_table(40))); // 逗號表格無 pipe → markdown 不認領
+}
+
+#[test]
+fn md_registered_before_csv() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let s = names.iter().position(|&n| n == "stacktrace").unwrap();
+    let m = names.iter().position(|&n| n == "markdown").unwrap();
+    let c = names.iter().position(|&n| n == "csv").unwrap();
+    let t = names.iter().position(|&n| n == "truncate").unwrap();
+    assert!(s < m && m < c && c < t, "順序須為 stacktrace < markdown < csv < truncate");
+}
+
+#[test]
+fn md_deterministic() {
+    let text = md_table(40);
     assert_eq!(squeeze_text(&text), squeeze_text(&text));
 }

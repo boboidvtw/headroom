@@ -716,8 +716,103 @@ pub const CSV: Strategy = Strategy {
     squeeze: csv_squeeze,
 };
 
-/// 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/csv 先嗅探，不命中才落 truncate 兜底。
-pub const STRATEGIES: &[Strategy] = &[JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE];
+// ── M18 — Markdown table 內容感知策略（Rust port，對齊 Python `strategies.py`）──
+//
+// 對象：GitHub-flavored markdown 表格（LLM 輸出、文件、README 裡極常見）。噪音 = 大量同構
+// 資料列；訊號 = 表頭（欄名）+ **分隔列 `|---|---|`**（定義欄位對齊、合法 markdown 表格的必要
+// 結構）+ 頭尾代表性資料列。壓法：保表頭 + 分隔列 + 前 MD_KEEP_HEAD + 後 MD_KEEP_TAIL 列，
+// 中段以單一 marker 取代（CCR store 保原文可逆）。
+//
+// 與 CSV（M17）的差別（不只換 delimiter）：markdown 表格多一條「分隔列」必須釘住保留 ——
+// truncate 以行為單位會把表頭與分隔列一起擠出視窗；本策略明確把兩者釘在輸出最前。
+//
+// 嗅探（保守、強訊號防誤判）：去單一尾端換行後行數 >= MIN_MD_LINES、無內部空行、每行含相同
+// 數量（>= 1）的 `|`，且第二行是合法分隔列（只由 `|` `:` `-` 空白組成且至少一個 `-`）。分隔列
+// 是與 CSV/散文的關鍵鑑別子。pipe/分隔列計數純 ASCII byte（`|`=0x7C / `-`=0x2D / `:`=0x3A 皆非
+// UTF-8 續位元組）→ 與 Python str.count 逐字節一致、Py/Rs parity。
+//
+// 收存點不對稱承襲 M11–M17：Rust squeeze 純函式回 Option、put 在 compress_block 呼叫端。
+
+const MIN_MD_LINES: usize = 8;
+const MD_KEEP_HEAD: usize = 3;
+const MD_KEEP_TAIL: usize = 2;
+const MIN_MD_DROP: usize = 4;
+
+/// markdown 表格分隔列判斷：只由 `|` `:` `-` 空白組成、且至少含一個 `-`。
+/// 純 ASCII byte 檢查（非 ASCII 字元的 byte 皆 >127、不在允許集 → 自動排除）。
+fn is_md_separator(line: &str) -> bool {
+    let bs = line.as_bytes();
+    let has_dash = bs.contains(&b'-');
+    has_dash && bs.iter().all(|&b| matches!(b, b'|' | b':' | b'-' | b' '))
+}
+
+/// 判斷是否為乾淨 markdown 表格：回 clean 行序列（含表頭、分隔列）或 `None`。
+/// 條件：去單一尾端換行後行數 >= MIN_MD_LINES、無內部空行、每行 `|` 數相同且 >= 1、
+/// 第二行是合法分隔列。`|` 計數純 ASCII byte（沿用 byte_count）。
+fn md_rows(text: &str) -> Option<Vec<&str>> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop(); // 容忍單一尾端換行
+    }
+    if lines.len() < MIN_MD_LINES {
+        return None;
+    }
+    if lines.iter().any(|l| l.is_empty()) {
+        return None; // 內部空行 → 非乾淨表格
+    }
+    let c0 = byte_count(lines[0], b'|');
+    if c0 < 1 || lines.iter().any(|l| byte_count(l, b'|') != c0) {
+        return None; // 每行 pipe 數須一致且 >= 1
+    }
+    if !is_md_separator(lines[1]) {
+        return None; // 第二行須為分隔列 —— 與 CSV/散文的關鍵鑑別子
+    }
+    Some(lines)
+}
+
+/// 純函式：保表頭 + 分隔列 + 頭尾資料列、中段塞 marker。壓不動回 `None`。
+fn md_squeeze_core(text: &str) -> Option<String> {
+    let lines = md_rows(text)?;
+    let data_rows = lines.len() - 2; // 扣除表頭 + 分隔列
+    // 提前擋（同時避免 usize 下溢）：可丟列數不足 → None。
+    if data_rows < MD_KEEP_HEAD + MD_KEEP_TAIL + MIN_MD_DROP {
+        return None;
+    }
+    let dropped = data_rows - MD_KEEP_HEAD - MD_KEEP_TAIL;
+    let marker = format!(
+        "[... headroom-lite dropped {dropped} markdown table rows | sha256:{} ...]",
+        content_key(text)
+    );
+    let mut parts: Vec<&str> = Vec::with_capacity(2 + MD_KEEP_HEAD + 1 + MD_KEEP_TAIL);
+    parts.push(lines[0]); // 表頭恆保留
+    parts.push(lines[1]); // 分隔列恆保留（結構訊號）
+    parts.extend(&lines[2..2 + MD_KEEP_HEAD]); // 前 head 資料列
+    parts.push(&marker);
+    parts.extend(&lines[lines.len() - MD_KEEP_TAIL..]); // 後 tail 資料列
+    Some(parts.join("\n"))
+}
+
+/// 嗅探：是乾淨 markdown 表格、且中段可丟列數夠多（>= MIN_MD_DROP）才認領。
+fn md_applies(text: &str) -> bool {
+    md_squeeze_core(text).is_some()
+}
+
+/// 保表頭 + 分隔列 + 頭尾列；壓不動回 `None`（呼叫端保留原文、不 put）。
+fn md_squeeze(text: &str) -> Option<String> {
+    md_squeeze_core(text)
+}
+
+/// markdown 排在 stacktrace 之後、csv 之前：markdown 表格（pipe + 分隔列）比逗號 CSV 更專一，
+/// 兩者其實互斥（pipe vs 逗號）——markdown 先嗅探保證真 markdown 表格不被 csv 誤搶；既有 csv
+/// fixture 無 pipe → markdown 不認領、零回歸。
+pub const MARKDOWN: Strategy = Strategy {
+    name: "markdown",
+    applies: md_applies,
+    squeeze: md_squeeze,
+};
+
+/// 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/markdown/csv 先嗅探，不命中才落 truncate 兜底。
+pub const STRATEGIES: &[Strategy] = &[JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, TRUNCATE];
 
 /// dispatcher：選第一個 applies 命中的策略來壓，命中即停。預設用模組級註冊表。
 pub fn squeeze_text(text: &str) -> Option<String> {
