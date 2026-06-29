@@ -9,8 +9,8 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, BLOB, CSV, DIFF, HEAD_LINES, JSON, LOG, MARKDOWN,
-    SEARCH, STACKTRACE, STRATEGIES, TAIL_LINES, TRUNCATE,
+    squeeze_text, squeeze_text_with, Strategy, BLOB, CSV, DIFF, HEAD_LINES, HTML, JSON, LOG,
+    MARKDOWN, SEARCH, STACKTRACE, STRATEGIES, TAIL_LINES, TRUNCATE,
 };
 
 fn long_text() -> String {
@@ -881,4 +881,126 @@ fn blob_registered_after_csv_before_truncate() {
 fn blob_deterministic() {
     let text = blob_uri(2000);
     assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
+
+// ── M20：HTML/XML 內容感知策略（對齊 Python test_strategies.py）──
+
+/// 含單一巨型 inline <script> 的 HTML 文件；其餘為真實結構。
+fn html_script(inner_len: usize) -> String {
+    let inner = "a".repeat(inner_len);
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n\
+         <script type=\"text/javascript\">{inner}</script>\n\
+         </head>\n<body>\n<h1>Title</h1>\n<p>Real content.</p>\n</body>\n</html>"
+    )
+}
+
+fn html_style(inner_len: usize) -> String {
+    let inner = format!(".x{{color:red}}{}", "/* pad */".repeat(inner_len / 8 + 1));
+    format!("<html><head><style>{inner}</style></head><body><p>hi</p></body></html>")
+}
+
+fn html_comment(inner_len: usize) -> String {
+    let inner = "x".repeat(inner_len);
+    format!("<html><body><!--{inner}--><p>real</p></body></html>")
+}
+
+#[test]
+fn html_applies_on_script_doc() {
+    assert!((HTML.applies)(&html_script(1000)));
+}
+
+#[test]
+fn html_applies_false_on_small_noise() {
+    assert!(!(HTML.applies)(&html_script(100)));
+}
+
+#[test]
+fn html_applies_false_on_prose() {
+    let prose = (0..40)
+        .map(|i| format!("paragraph {i} of plain prose without markup"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(HTML.applies)(&prose));
+}
+
+#[test]
+fn html_squeeze_keeps_tags_drops_inner() {
+    let text = html_script(1000);
+    let out = (HTML.squeeze)(&text).expect("HTML 該壓");
+    assert!(out.contains("<script type=\"text/javascript\">"));
+    assert!(out.contains("</script>"));
+    assert!(out.contains("<h1>Title</h1>"));
+    assert!(!out.contains("aaaaaaaaaa"));
+    assert!(out.contains("html noise chars"));
+    assert!(out.len() < text.len());
+}
+
+#[test]
+fn html_marker_has_count_and_key() {
+    let text = html_script(1000);
+    let out = squeeze_text(&text).expect("HTML 該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&text))));
+    assert!(out.contains("dropped 1000 html noise chars"));
+}
+
+#[test]
+fn html_collapses_style() {
+    let text = html_style(1000);
+    let out = (HTML.squeeze)(&text).expect("style 該壓");
+    assert!(out.contains("<style>") && out.contains("</style>"));
+    assert!(out.contains("html noise chars"));
+    assert!(out.contains("<p>hi</p>"));
+}
+
+#[test]
+fn html_collapses_comment() {
+    let text = html_comment(1000);
+    let out = (HTML.squeeze)(&text).expect("comment 該壓");
+    assert!(out.contains("<!--") && out.contains("-->"));
+    assert!(!out.contains("xxxxxxxxxx"));
+    assert!(out.contains("<p>real</p>"));
+}
+
+#[test]
+fn html_preserves_non_ascii() {
+    // 非 ASCII 文字內容（中文）須逐字保留 —— byte-index 切片在 ASCII 標籤邊界、不破 UTF-8。
+    let inner = "a".repeat(1000);
+    let text =
+        format!("<html><body><h1>標題中文</h1><script>{inner}</script><p>內文</p></body></html>");
+    let out = (HTML.squeeze)(&text).expect("HTML 該壓");
+    assert!(out.contains("標題中文"));
+    assert!(out.contains("內文"));
+    assert!(out.contains("html noise chars"));
+}
+
+#[test]
+fn html_deterministic() {
+    let text = html_script(1000);
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
+
+#[test]
+fn html_no_compress_returns_none() {
+    assert_eq!((HTML.squeeze)(&html_script(100)), None);
+}
+
+#[test]
+fn html_does_not_swallow_other_strategies() {
+    assert!(!(HTML.applies)(&noisy_log()));
+    assert!(!(HTML.applies)(&diff()));
+    assert!(!(HTML.applies)(&search_default()));
+    assert!(!(HTML.applies)(&csv_table(40)));
+    assert!(!(HTML.applies)(&md_table(40)));
+    assert!(!(HTML.applies)(&blob_uri(2000)));
+}
+
+#[test]
+fn html_registered_before_blob_after_csv() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let c = names.iter().position(|&n| n == "csv").unwrap();
+    let h = names.iter().position(|&n| n == "html").unwrap();
+    let b = names.iter().position(|&n| n == "blob").unwrap();
+    let t = names.iter().position(|&n| n == "truncate").unwrap();
+    assert!(c < h && h < b && b < t, "順序須為 csv < html < blob < truncate");
 }

@@ -879,3 +879,126 @@ def test_blob_does_not_swallow_other_strategies():
 def test_blob_registered_after_csv_before_truncate():
     names = [s.name for s in STRATEGIES]
     assert names.index("csv") < names.index("blob") < names.index("truncate")
+
+
+# ── M20：HTML/XML 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import (  # noqa: E402
+    HTML,
+    MIN_HTML_NOISE,
+    _html_squeeze,
+)
+
+
+def _html_script(inner_len: int = 1000) -> str:
+    """含單一巨型 inline <script> 的 HTML 文件；其餘為真實結構。"""
+    inner = "a" * inner_len
+    return (
+        "<!DOCTYPE html>\n<html>\n<head>\n"
+        f'<script type="text/javascript">{inner}</script>\n'
+        "</head>\n<body>\n<h1>Title</h1>\n<p>Real content.</p>\n</body>\n</html>"
+    )
+
+
+def _html_style(inner_len: int = 1000) -> str:
+    inner = ".x{color:red}" + "/* pad */" * ((inner_len // 8) + 1)
+    return f"<html><head><style>{inner}</style></head><body><p>hi</p></body></html>"
+
+
+def _html_comment(inner_len: int = 1000) -> str:
+    inner = "x" * inner_len
+    return f"<html><body><!--{inner}--><p>real</p></body></html>"
+
+
+def test_html_applies_on_script_doc():
+    assert HTML.applies(_html_script(1000)) is True
+
+
+def test_html_applies_false_on_small_noise():
+    # script 內文 < MIN_HTML_NOISE → 不認領。
+    assert HTML.applies(_html_script(100)) is False
+
+
+def test_html_applies_false_on_prose():
+    prose = "\n".join(f"paragraph {i} of plain prose without markup" for i in range(40))
+    assert HTML.applies(prose) is False
+
+
+def test_html_squeeze_keeps_tags_drops_inner():
+    text = _html_script(1000)
+    out = _html_squeeze(text)
+    assert '<script type="text/javascript">' in out  # 開標籤保留
+    assert "</script>" in out  # 閉標籤保留
+    assert "<h1>Title</h1>" in out  # 真實結構保留
+    assert "aaaaaaaaaa" not in out  # 內文被丟
+    assert "html noise chars" in out
+    assert len(out) < len(text)
+
+
+def test_html_marker_has_count_and_key():
+    text = _html_script(1000)
+    out = squeeze_text(text)
+    assert f"sha256:{content_key(text)}" in out
+    assert "dropped 1000 html noise chars" in out
+
+
+def test_html_collapses_style():
+    text = _html_style(1000)
+    out = _html_squeeze(text)
+    assert "<style>" in out and "</style>" in out
+    assert "html noise chars" in out
+    assert "<p>hi</p>" in out
+
+
+def test_html_collapses_comment():
+    text = _html_comment(1000)
+    out = _html_squeeze(text)
+    assert "<!--" in out and "-->" in out  # 註解邊界保留
+    assert "xxxxxxxxxx" not in out  # 註解內文被丟
+    assert "<p>real</p>" in out
+
+
+def test_html_preserves_non_ascii():
+    # 非 ASCII 文字內容（中文）須逐字保留 —— native-index 切片不依賴 ASCII。
+    inner = "a" * 1000
+    text = f"<html><body><h1>標題中文</h1><script>{inner}</script><p>內文</p></body></html>"
+    out = _html_squeeze(text)
+    assert "標題中文" in out
+    assert "內文" in out
+    assert "html noise chars" in out
+
+
+def test_html_deterministic():
+    text = _html_script(1000)
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_html_stores_original_before_squeezing():
+    store = _SpyStore()
+    text = _html_script(1000)
+    squeeze_text(text, store=store)
+    assert store.puts == [text]
+
+
+def test_html_no_compress_returns_text_without_put():
+    store = _SpyStore()
+    text = _html_script(100)  # 內文太小
+    assert _html_squeeze(text, store) == text
+    assert store.puts == []
+
+
+def test_html_does_not_swallow_other_strategies():
+    # 不回歸：log/diff/search/csv/markdown/blob 皆無 <script>/<style>/<!-- 噪音區。
+    assert HTML.applies(_noisy_log()) is False
+    assert HTML.applies(_diff()) is False
+    assert HTML.applies(_search()) is False
+    assert HTML.applies(_csv_table(40)) is False
+    assert HTML.applies(_md_table(40)) is False
+    assert HTML.applies(_blob(2000)) is False
+
+
+def test_html_registered_before_blob_after_csv():
+    # HTML 排 blob 前：含 inline script 的頁面該走 HTML（保結構）、非被 blob 當巨串吞掉；
+    # 但 data URI 無 <script> → HTML 不認領、落 blob。
+    names = [s.name for s in STRATEGIES]
+    assert names.index("csv") < names.index("html") < names.index("blob")
+    assert names.index("blob") < names.index("truncate")

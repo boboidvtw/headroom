@@ -839,7 +839,114 @@ def _blob_squeeze(text: str, store=None) -> str:
 # json 需 `[`/`{` 開頭 → 都讓過，blob 接住「否則落 truncate 卻因單行無法壓」的巨型 blob。
 BLOB = Strategy("blob", _blob_applies, _blob_squeeze)
 
-# 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/markdown/csv/blob 先嗅探，不命中才落 truncate 兜底。
+
+# ── M20 — HTML/XML 內容感知策略（第九片「嗅探→壓」內容策略）──
+#
+# 對象：HTML/XML 文件（網頁爬取結果）。噪音 = `<script>`/`<style>` 元素的內文（巨型 inline
+# JS/CSS bundle）+ `<!-- -->` 註解；訊號 = 標籤結構與可見文字。壓法：保留每個噪音區的「邊界」
+# （script/style 的開閉標籤、註解的 `<!--`/`-->`），把內文換成單一 marker（CCR store 可逆）。
+#
+# 與盲目頭尾截斷的差別：truncate 不懂「script 內文是噪音、結構與文字是訊號」——巨型 inline JS
+# 一多就把頁面真正內容擠出視窗；HTML 策略精準只挖掉 script/style/comment 內文、保住結構與文字。
+#
+# ⭐ parity（沿用 M15 JSON 模式，非 ASCII 安全）：Python 用 **char index** find/slice、Rust 用
+# **byte index**，各自原生索引定位同一邏輯位置（同一個 `<script>`、同一個 `>`）→ 切出的邏輯子
+# 字串相同、最終輸出 bytes 一致。故非 ASCII 文字內容（中文網頁）逐字保留、兩語言逐字節一致。
+# 標籤名只比對小寫（`<script`/`<style`，保守、避開 unicode lower() 改變長度的 index 陷阱）。
+#
+# 嗅探（保守、強訊號）：須存在至少一個「有正確閉合、內文 >= MIN_HTML_NOISE」的噪音區。散文/
+# 其他結構（log/diff/json/csv/markdown/blob）無 `<script`/`<style`/`<!--` 噪音區 → 不認領。
+# 收存點對稱 M15：核心純函式回 Option、put 在呼叫端（_html_squeeze）。
+
+MIN_HTML_NOISE = 256  # 噪音區內文長度下限 —— 低於此不挖（marker 開銷不划算）
+_HTML_NOISE_TAGS = ("script", "style")  # raw-text 元素：內文為噪音；只比對小寫（保守）
+
+
+def _html_noise_regions(text: str) -> list[tuple[int, int]]:
+    """回所有「可挖」噪音區的 (inner_start, inner_end)，保序、不重疊、內文 >= MIN_HTML_NOISE。
+
+    噪音區 = `<script ...>內文</script>` / `<style ...>內文</style>` / `<!--內文-->`。
+    只比對小寫標籤、native char index（Rust 端對應 byte index）→ 兩語言定位同一邏輯位置。
+    """
+    regions: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        # 找最早出現的噪音開頭：<script / <style / <!--
+        best_pos = -1
+        best_kind = ""
+        for tag in _HTML_NOISE_TAGS:
+            p = text.find("<" + tag, i)
+            if p != -1 and (best_pos == -1 or p < best_pos):
+                best_pos, best_kind = p, tag
+        pc = text.find("<!--", i)
+        if pc != -1 and (best_pos == -1 or pc < best_pos):
+            best_pos, best_kind = pc, "<!--"
+        if best_pos == -1:
+            break
+
+        if best_kind == "<!--":
+            inner_start = best_pos + 4  # len("<!--")
+            close = text.find("-->", inner_start)
+            if close == -1:
+                break  # 未終結註解 → 停（保守，不挖）
+            inner_end = close
+            nxt = close + 3
+        else:
+            gt = text.find(">", best_pos)
+            if gt == -1:
+                break  # 開標籤未閉合 → 停
+            inner_start = gt + 1
+            close = text.find("</" + best_kind, inner_start)
+            if close == -1:
+                i = gt + 1  # 找不到閉標籤 → 跳過此開頭、保證前進
+                continue
+            inner_end = close
+            nxt = close  # 從閉標籤處續掃（`</tag` 不會誤配 `<tag`）
+
+        if inner_end - inner_start >= MIN_HTML_NOISE:
+            regions.append((inner_start, inner_end))
+        i = nxt if nxt > i else i + 1  # 保證前進，杜絕無窮迴圈
+    return regions
+
+
+def _html_squeeze_core(text: str) -> str | None:
+    """純函式：把每個噪音區的內文換成 marker、保留邊界與結構。無可挖區回 None。"""
+    regions = _html_noise_regions(text)
+    if not regions:
+        return None
+    digest = content_key(text)
+    parts: list[str] = []
+    prev = 0
+    for start, end in regions:
+        parts.append(text[prev:start])  # 邊界 + 結構（含非 ASCII 文字）逐字保留
+        dropped = end - start
+        parts.append(f"[... headroom-lite dropped {dropped} html noise chars | sha256:{digest} ...]")
+        prev = end
+    parts.append(text[prev:])
+    return "".join(parts)
+
+
+def _html_applies(text: str) -> bool:
+    """嗅探：存在至少一個內文 >= MIN_HTML_NOISE 的 script/style/comment 噪音區才認領。"""
+    return _html_squeeze_core(text) is not None
+
+
+def _html_squeeze(text: str, store=None) -> str:
+    """挖掉 script/style/comment 內文；無可挖 → 原文回、絕不 put（神聖時機契約）。"""
+    out = _html_squeeze_core(text)
+    if out is None:
+        return text
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    return out
+
+
+# html 排在 csv 之後、blob 之前：含 inline script 的頁面該走 HTML（保結構）而非被 blob 當巨串
+# 吞掉；data URI 無 `<script`/`<style`/`<!--` → HTML 不認領、落 blob。既有 fixture 皆無噪音區
+# → HTML 不認領、零回歸。
+HTML = Strategy("html", _html_applies, _html_squeeze)
+
+# 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/markdown/csv/html/blob 先嗅探，不命中才落 truncate 兜底。
 STRATEGIES: tuple[Strategy, ...] = (
     JSON,
     DIFF,
@@ -848,6 +955,7 @@ STRATEGIES: tuple[Strategy, ...] = (
     STACKTRACE,
     MARKDOWN,
     CSV,
+    HTML,
     BLOB,
     TRUNCATE,
 )

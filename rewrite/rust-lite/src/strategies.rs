@@ -907,9 +907,125 @@ pub const BLOB: Strategy = Strategy {
     squeeze: blob_squeeze,
 };
 
-/// 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/markdown/csv/blob 先嗅探，不命中才落 truncate 兜底。
+// ── M20 — HTML/XML 內容感知策略（Rust port，對齊 Python `strategies.py`）──
+//
+// 對象：HTML/XML 文件（網頁爬取）。噪音 = `<script>`/`<style>` 內文（巨型 inline JS/CSS）+
+// `<!-- -->` 註解；訊號 = 標籤結構與可見文字。壓法：保留每個噪音區的邊界（開閉標籤 / 註解
+// `<!--` `-->`），把內文換成單一 marker（CCR store 可逆）。
+//
+// ⭐ parity（沿用 M15 JSON 模式，非 ASCII 安全）：Rust 用 **byte index** find/slice、Python 用
+// **char index**，各自原生索引定位同一邏輯位置 → 切出的邏輯子字串相同、輸出 bytes 一致。標籤名
+// 只比對小寫（避開 unicode lower() 改變長度的 index 陷阱）。切點都在 ASCII 標籤邊界 → 不破 UTF-8。
+//
+// 收存點不對稱承襲 M11–M19：Rust squeeze 純函式回 Option、put 在 compress_block 呼叫端。
+
+const MIN_HTML_NOISE: usize = 256;
+const HTML_NOISE_TAGS: [&str; 2] = ["script", "style"];
+
+/// 從 byte 位置 `from` 起找 `pat`，回絕對 byte 位置或 `None`。
+fn find_from(text: &str, pat: &str, from: usize) -> Option<usize> {
+    text[from..].find(pat).map(|p| from + p)
+}
+
+/// 回所有「可挖」噪音區的 (inner_start, inner_end)（byte offset），保序、不重疊、內文 >= MIN_HTML_NOISE。
+fn html_noise_regions(text: &str) -> Vec<(usize, usize)> {
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    let n = text.len();
+    let mut i = 0;
+    while i < n {
+        // 找最早出現的噪音開頭：<script / <style / <!--
+        let mut best_pos: Option<usize> = None;
+        let mut best_kind = "";
+        for tag in HTML_NOISE_TAGS {
+            let needle = format!("<{tag}");
+            if let Some(p) = find_from(text, &needle, i) {
+                if best_pos.is_none_or(|b| p < b) {
+                    best_pos = Some(p);
+                    best_kind = tag;
+                }
+            }
+        }
+        if let Some(pc) = find_from(text, "<!--", i) {
+            if best_pos.is_none_or(|b| pc < b) {
+                best_pos = Some(pc);
+                best_kind = "<!--";
+            }
+        }
+        let Some(pos) = best_pos else { break };
+
+        let (inner_start, inner_end, nxt);
+        if best_kind == "<!--" {
+            inner_start = pos + 4; // len("<!--")
+            let Some(close) = find_from(text, "-->", inner_start) else {
+                break; // 未終結註解 → 停（保守）
+            };
+            inner_end = close;
+            nxt = close + 3;
+        } else {
+            let Some(gt) = find_from(text, ">", pos) else {
+                break; // 開標籤未閉合
+            };
+            inner_start = gt + 1;
+            let closer = format!("</{best_kind}");
+            let Some(close) = find_from(text, &closer, inner_start) else {
+                i = gt + 1; // 找不到閉標籤 → 跳過此開頭、保證前進
+                continue;
+            };
+            inner_end = close;
+            nxt = close; // 從閉標籤處續掃（`</tag` 不會誤配 `<tag`）
+        }
+
+        if inner_end - inner_start >= MIN_HTML_NOISE {
+            regions.push((inner_start, inner_end));
+        }
+        i = if nxt > i { nxt } else { i + 1 }; // 保證前進
+    }
+    regions
+}
+
+/// 純函式：把每個噪音區的內文換成 marker、保留邊界與結構。無可挖區回 `None`。
+fn html_squeeze_core(text: &str) -> Option<String> {
+    let regions = html_noise_regions(text);
+    if regions.is_empty() {
+        return None;
+    }
+    let digest = content_key(text);
+    let mut out = String::new();
+    let mut prev = 0;
+    for (start, end) in regions {
+        out.push_str(&text[prev..start]); // 邊界 + 結構（含非 ASCII 文字）逐字保留
+        let dropped = end - start;
+        out.push_str(&format!(
+            "[... headroom-lite dropped {dropped} html noise chars | sha256:{digest} ...]"
+        ));
+        prev = end;
+    }
+    out.push_str(&text[prev..]);
+    Some(out)
+}
+
+/// 嗅探：存在至少一個內文 >= MIN_HTML_NOISE 的 script/style/comment 噪音區才認領。
+fn html_applies(text: &str) -> bool {
+    html_squeeze_core(text).is_some()
+}
+
+/// 挖掉 script/style/comment 內文；無可挖回 `None`（呼叫端保留原文、不 put）。
+fn html_squeeze(text: &str) -> Option<String> {
+    html_squeeze_core(text)
+}
+
+/// html 排在 csv 之後、blob 之前：含 inline script 的頁面該走 HTML（保結構）而非被 blob 當巨串
+/// 吞掉；data URI 無 `<script`/`<style`/`<!--` → HTML 不認領、落 blob。既有 fixture 皆無噪音區
+/// → HTML 不認領、零回歸。
+pub const HTML: Strategy = Strategy {
+    name: "html",
+    applies: html_applies,
+    squeeze: html_squeeze,
+};
+
+/// 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/markdown/csv/html/blob 先嗅探，不命中才落 truncate 兜底。
 pub const STRATEGIES: &[Strategy] =
-    &[JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, BLOB, TRUNCATE];
+    &[JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, HTML, BLOB, TRUNCATE];
 
 /// dispatcher：選第一個 applies 命中的策略來壓，命中即停。預設用模組級註冊表。
 pub fn squeeze_text(text: &str) -> Option<String> {
