@@ -628,8 +628,96 @@ pub const STACKTRACE: Strategy = Strategy {
     squeeze: stack_squeeze,
 };
 
-/// 策略註冊表：按優先序排列。json/diff/search/log/stacktrace 先嗅探，不命中才落到 truncate 兜底。
-pub const STRATEGIES: &[Strategy] = &[JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE];
+// ── M17 — CSV/表格 內容感知策略（Rust port，對齊 Python `strategies.py`）──
+//
+// 對象：CSV/TSV 等表格輸出（DB 查詢結果、`column` 對齊匯出、資料表 dump）。噪音 = 大量
+// 同構資料列；訊號 = 表頭（欄名）+ 頭尾代表性資料列。壓法：保表頭 + 前 CSV_KEEP_HEAD +
+// 後 CSV_KEEP_TAIL 列，中段以單一 marker 取代（CCR store 保原文可逆）。
+//
+// 與盲目頭尾截斷的差別：truncate 不理解「表頭=訊號」的語意——資料列多到把表頭擠出 HEAD_LINES
+// 視窗時欄名就此遺失；CSV 策略明確把表頭釘在輸出第一行、再配頭尾代表列。
+//
+// 嗅探（保守、強訊號防誤判）：去單一尾端換行後，**每一非空行**都以同一 delimiter（`,` 優先、
+// 再 `\t`）出現「相同次數且 >= 1」才認領 —— 散文不可能每行逗號數一致。含內部空行 → 不認領。
+// 引號內逗號破壞「每行同數」而自動落 truncate 兜底（保守）。delimiter 計數純 ASCII byte
+// （`,`=0x2C / `\t`=0x09 皆非 UTF-8 續位元組）→ 與 Python str.count 逐字節一致。
+//
+// 收存點不對稱承襲 M11–M16：Rust squeeze 純函式回 Option、put 在 compress_block 呼叫端。
+
+const MIN_CSV_LINES: usize = 8;
+const CSV_KEEP_HEAD: usize = 3;
+const CSV_KEEP_TAIL: usize = 2;
+const MIN_CSV_DROP: usize = 4;
+
+/// 某 ASCII byte 在一行中的出現次數（純 byte，對齊 Python `str.count` 對單 ASCII 字元）。
+fn byte_count(line: &str, b: u8) -> usize {
+    line.bytes().filter(|&x| x == b).count()
+}
+
+/// 判斷是否為乾淨表格：回 clean 行序列（含表頭）或 `None`。
+/// 條件：去單一尾端換行後行數 >= MIN_CSV_LINES、無內部空行、且某 delimiter（`,` 優先、
+/// 再 `\t`）讓每行出現次數相同且 >= 1。
+fn csv_rows(text: &str) -> Option<Vec<&str>> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop(); // 容忍單一尾端換行
+    }
+    if lines.len() < MIN_CSV_LINES {
+        return None;
+    }
+    if lines.iter().any(|l| l.is_empty()) {
+        return None; // 內部空行 → 非乾淨表格
+    }
+    for delim in [b',', b'\t'] {
+        let c0 = byte_count(lines[0], delim);
+        if c0 >= 1 && lines.iter().all(|l| byte_count(l, delim) == c0) {
+            return Some(lines);
+        }
+    }
+    None
+}
+
+/// 純函式：保表頭 + 頭尾資料列、中段塞 marker。壓不動回 `None`。
+fn csv_squeeze_core(text: &str) -> Option<String> {
+    let lines = csv_rows(text)?;
+    let data_rows = lines.len() - 1;
+    // 提前擋（同時避免 usize 下溢）：可丟列數不足 → None。
+    if data_rows < CSV_KEEP_HEAD + CSV_KEEP_TAIL + MIN_CSV_DROP {
+        return None;
+    }
+    let dropped = data_rows - CSV_KEEP_HEAD - CSV_KEEP_TAIL;
+    let marker = format!(
+        "[... headroom-lite dropped {dropped} table rows | sha256:{} ...]",
+        content_key(text)
+    );
+    let mut parts: Vec<&str> = Vec::with_capacity(1 + CSV_KEEP_HEAD + 1 + CSV_KEEP_TAIL);
+    parts.push(lines[0]); // 表頭恆保留
+    parts.extend(&lines[1..1 + CSV_KEEP_HEAD]); // 前 head 資料列
+    parts.push(&marker);
+    parts.extend(&lines[lines.len() - CSV_KEEP_TAIL..]); // 後 tail 資料列
+    Some(parts.join("\n"))
+}
+
+/// 嗅探：是乾淨表格、且中段可丟列數夠多（>= MIN_CSV_DROP）才認領。
+fn csv_applies(text: &str) -> bool {
+    csv_squeeze_core(text).is_some()
+}
+
+/// 保表頭 + 頭尾列；壓不動回 `None`（呼叫端保留原文、不 put）。
+fn csv_squeeze(text: &str) -> Option<String> {
+    csv_squeeze_core(text)
+}
+
+/// csv 排在 stacktrace 之後、truncate 之前：表格無 JSON/diff/search/log/frame 結構 → 不被前面
+/// 策略認領、落到此；既有 fixture 已由前面策略接走，csv 只接純表格 → 零回歸。
+pub const CSV: Strategy = Strategy {
+    name: "csv",
+    applies: csv_applies,
+    squeeze: csv_squeeze,
+};
+
+/// 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/csv 先嗅探，不命中才落 truncate 兜底。
+pub const STRATEGIES: &[Strategy] = &[JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE];
 
 /// dispatcher：選第一個 applies 命中的策略來壓，命中即停。預設用模組級註冊表。
 pub fn squeeze_text(text: &str) -> Option<String> {

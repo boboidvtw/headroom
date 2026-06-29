@@ -580,3 +580,106 @@ def test_json_registered_first():
     names = [s.name for s in STRATEGIES]
     assert names[0] == "json"
     assert names.index("json") < names.index("diff") < names.index("search") < names.index("log")
+
+
+# ── M17：CSV/表格 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import (
+    CSV,
+    CSV_KEEP_HEAD,
+    CSV_KEEP_TAIL,
+    _csv_squeeze,
+)
+
+
+def _csv_table(rows: int = 40) -> str:
+    """逗號分隔表格：1 表頭 + N 資料列，每列同欄數（4 欄 → 3 逗號）。"""
+    header = "id,name,department,salary"
+    body = "\n".join(f"{i},user{i},engineering,{50000 + i}" for i in range(rows))
+    return f"{header}\n{body}"
+
+
+def _tsv_table(rows: int = 40) -> str:
+    """Tab 分隔表格：1 表頭 + N 資料列（3 欄 → 2 tab）。"""
+    header = "id\tname\tcity"
+    body = "\n".join(f"{i}\tuser{i}\ttaipei" for i in range(rows))
+    return f"{header}\n{body}"
+
+
+def test_csv_applies_on_comma_and_tab_tables():
+    assert CSV.applies(_csv_table(40)) is True
+    assert CSV.applies(_tsv_table(40)) is True
+
+
+def test_csv_applies_false_on_few_droppable_rows():
+    # 9 行（1 表頭 + 8 資料）：8 - 3 - 2 = 3 可丟 < MIN_CSV_DROP(4) → 不認領。
+    assert CSV.applies(_csv_table(8)) is False
+
+
+def test_csv_applies_false_on_prose():
+    prose = "\n".join(f"the quick brown fox jumped {i}" for i in range(40))
+    assert CSV.applies(prose) is False
+
+
+def test_csv_applies_false_on_inconsistent_columns():
+    # 每行逗號數不一致（散文夾雜逗號）→ 「每行同數」嗅探擋下，不認領。
+    text = "\n".join(["a,b,c"] + [f"line {i}, one comma" for i in range(40)])
+    assert CSV.applies(text) is False
+
+
+def test_csv_applies_false_on_interior_blank_line():
+    # 含內部空行 → 非乾淨表格，落 truncate 兜底。
+    rows = [f"{i},user{i},eng,{i}" for i in range(40)]
+    rows.insert(20, "")  # 中段插空行
+    text = "id,name,dept,n\n" + "\n".join(rows)
+    assert CSV.applies(text) is False
+
+
+def test_csv_squeeze_keeps_header_head_tail():
+    text = _csv_table(40)
+    out = _csv_squeeze(text)
+    lines = out.split("\n")
+    assert lines[0] == "id,name,department,salary"  # 表頭恆保留
+    assert lines[1] == "0,user0,engineering,50000"  # 第一筆資料列
+    assert lines[-1] == "39,user39,engineering,50039"  # 最後一筆資料列
+    assert any("dropped" in line and "table rows" in line for line in lines)
+    # 輸出行數 = 表頭 + head + marker + tail。
+    assert len(lines) == 1 + CSV_KEEP_HEAD + 1 + CSV_KEEP_TAIL
+
+
+def test_csv_marker_has_count_and_key():
+    text = _csv_table(40)
+    out = squeeze_text(text)
+    assert f"sha256:{content_key(text)}" in out
+    assert "dropped 35 table rows" in out  # 40 - 3 - 2 = 35
+
+
+def test_csv_deterministic():
+    text = _csv_table(40)
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_csv_stores_original_before_squeezing():
+    store = _SpyStore()
+    text = _csv_table(40)
+    squeeze_text(text, store=store)
+    assert store.puts == [text]
+
+
+def test_csv_no_compress_returns_text_without_put():
+    # 可丟列數不足 → 原文回、絕不 put（神聖時機契約）。
+    store = _SpyStore()
+    text = _csv_table(8)
+    assert _csv_squeeze(text, store) == text
+    assert store.puts == []
+
+
+def test_csv_does_not_swallow_other_strategies():
+    # 不回歸：log/diff/search 由各自策略接走，csv 不搶（它們非「每行同逗號數」表格）。
+    assert CSV.applies(_noisy_log()) is False
+    assert CSV.applies(_diff()) is False
+    assert CSV.applies(_search()) is False
+
+
+def test_csv_registered_after_stacktrace_before_truncate():
+    names = [s.name for s in STRATEGIES]
+    assert names.index("stacktrace") < names.index("csv") < names.index("truncate")

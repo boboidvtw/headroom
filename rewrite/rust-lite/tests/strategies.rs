@@ -9,7 +9,7 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, DIFF, HEAD_LINES, JSON, LOG, SEARCH, STACKTRACE,
+    squeeze_text, squeeze_text_with, Strategy, CSV, DIFF, HEAD_LINES, JSON, LOG, SEARCH, STACKTRACE,
     STRATEGIES, TAIL_LINES, TRUNCATE,
 };
 
@@ -578,5 +578,111 @@ fn stack_registered_after_log_before_truncate() {
 #[test]
 fn stack_deterministic() {
     let text = py_recursion_trace(15);
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
+
+// ── M17：CSV/表格 內容感知策略（對齊 Python test_strategies.py）──
+
+/// 逗號分隔表格：1 表頭 + N 資料列，每列同欄數（4 欄 → 3 逗號）。
+fn csv_table(rows: usize) -> String {
+    let header = "id,name,department,salary";
+    let body: Vec<String> = (0..rows)
+        .map(|i| format!("{i},user{i},engineering,{}", 50000 + i))
+        .collect();
+    format!("{header}\n{}", body.join("\n"))
+}
+
+/// Tab 分隔表格：1 表頭 + N 資料列（3 欄 → 2 tab）。
+fn tsv_table(rows: usize) -> String {
+    let header = "id\tname\tcity";
+    let body: Vec<String> = (0..rows).map(|i| format!("{i}\tuser{i}\ttaipei")).collect();
+    format!("{header}\n{}", body.join("\n"))
+}
+
+#[test]
+fn csv_applies_on_comma_and_tab_tables() {
+    assert!((CSV.applies)(&csv_table(40)));
+    assert!((CSV.applies)(&tsv_table(40)));
+}
+
+#[test]
+fn csv_applies_false_on_few_droppable_rows() {
+    // 8 資料列：8 - 3 - 2 = 3 可丟 < MIN_CSV_DROP(4) → 不認領。
+    assert!(!(CSV.applies)(&csv_table(8)));
+}
+
+#[test]
+fn csv_applies_false_on_prose() {
+    let prose = (0..40)
+        .map(|i| format!("the quick brown fox jumped {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(CSV.applies)(&prose));
+}
+
+#[test]
+fn csv_applies_false_on_inconsistent_columns() {
+    // 每行逗號數不一致 → 「每行同數」嗅探擋下。
+    let mut lines = vec!["a,b,c".to_string()];
+    lines.extend((0..40).map(|i| format!("line {i}, one comma")));
+    assert!(!(CSV.applies)(&lines.join("\n")));
+}
+
+#[test]
+fn csv_applies_false_on_interior_blank_line() {
+    // 含內部空行 → 非乾淨表格，落 truncate 兜底。
+    let mut rows: Vec<String> = (0..40).map(|i| format!("{i},user{i},eng,{i}")).collect();
+    rows.insert(20, String::new());
+    let text = format!("id,name,dept,n\n{}", rows.join("\n"));
+    assert!(!(CSV.applies)(&text));
+}
+
+#[test]
+fn csv_squeeze_keeps_header_head_tail() {
+    let text = csv_table(40);
+    let out = (CSV.squeeze)(&text).expect("表格該壓");
+    let lines: Vec<&str> = out.split('\n').collect();
+    assert_eq!(lines[0], "id,name,department,salary"); // 表頭恆保留
+    assert_eq!(lines[1], "0,user0,engineering,50000"); // 第一筆資料列
+    assert_eq!(*lines.last().unwrap(), "39,user39,engineering,50039"); // 最後一筆
+    assert!(out.contains("table rows"));
+    // 輸出行數 = 表頭 + head(3) + marker + tail(2) = 7。
+    assert_eq!(lines.len(), 1 + 3 + 1 + 2);
+}
+
+#[test]
+fn csv_marker_has_count_and_key() {
+    let text = csv_table(40);
+    let out = squeeze_text(&text).expect("表格該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&text))));
+    assert!(out.contains("dropped 35 table rows")); // 40 - 3 - 2 = 35
+}
+
+#[test]
+fn csv_no_drop_returns_none() {
+    // 防禦性：squeeze 直呼但可丟列數不足 → None（呼叫端保留原文、不 put）。
+    assert_eq!((CSV.squeeze)(&csv_table(8)), None);
+}
+
+#[test]
+fn csv_does_not_swallow_other_strategies() {
+    // 不回歸：log/diff/search 非「每行同逗號數」表格 → csv 不搶。
+    assert!(!(CSV.applies)(&noisy_log()));
+    assert!(!(CSV.applies)(&diff()));
+    assert!(!(CSV.applies)(&search_default()));
+}
+
+#[test]
+fn csv_registered_after_stacktrace_before_truncate() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let s = names.iter().position(|&n| n == "stacktrace").unwrap();
+    let c = names.iter().position(|&n| n == "csv").unwrap();
+    let t = names.iter().position(|&n| n == "truncate").unwrap();
+    assert!(s < c && c < t, "順序須為 stacktrace < csv < truncate");
+}
+
+#[test]
+fn csv_deterministic() {
+    let text = csv_table(40);
     assert_eq!(squeeze_text(&text), squeeze_text(&text));
 }

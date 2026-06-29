@@ -569,8 +569,89 @@ def _stacktrace_squeeze(text: str, store=None) -> str:
 # 認領 → 落到此；既有 log/diff/search/json fixture 已由前面策略接走，stack 不回歸它們。
 STACKTRACE = Strategy("stacktrace", _stacktrace_applies, _stacktrace_squeeze)
 
-# 策略註冊表：按優先序排列。json/diff/search/log/stacktrace 先嗅探，不命中才落到 truncate 兜底。
-STRATEGIES: tuple[Strategy, ...] = (JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE)
+
+# ── M17 — CSV/表格 內容感知策略（第六片「嗅探→壓」內容策略）──
+#
+# 對象：CSV/TSV 等表格輸出（DB 查詢結果、`column` 對齊匯出、資料表 dump）。噪音 = 大量
+# 同構資料列；訊號 = 表頭（欄名）+ 頭尾代表性資料列。壓法：保表頭 + 前 CSV_KEEP_HEAD
+# + 後 CSV_KEEP_TAIL 列，中段以單一 marker 取代（CCR store 保原文可逆）。
+#
+# 與盲目頭尾截斷的差別：truncate 以「行」為單位、不理解「表頭=訊號」的語意——若資料列
+# 多到把表頭擠出 HEAD_LINES 視窗（如前綴有 SQL/說明文字），欄名就此遺失，剩下的數字列
+# 全無法判讀。CSV 策略明確把表頭釘在輸出第一行、再配頭尾代表列，丟的純是中段同構列。
+#
+# 嗅探（保守、強訊號防誤判）：去掉單一尾端換行後，**每一非空行**都以同一 delimiter
+# （`,` 優先、再 `\t`）出現「相同次數且 ≥1」才認領 —— 散文不可能每行逗號數一致，藉此
+# 擋掉誤判。含內部空行 → 不認領（非乾淨表格）。引號內逗號會破壞「每行同數」而自動落
+# truncate 兜底（保守，可接受）。delimiter 計數純 ASCII byte（`,`=0x2C / `\t`=0x09 皆非
+# UTF-8 續位元組，byte 數 == 字元數）→ Py/Rs 逐字節一致。
+#
+# 收存點對稱 M15：核心純函式回 Option、put 在呼叫端（_csv_squeeze）。
+
+MIN_CSV_LINES = 8  # 太少行不值得當表格處理（cheap floor；真正門檻是 MIN_CSV_DROP）
+CSV_KEEP_HEAD = 3  # 表頭後保留的前幾筆資料列
+CSV_KEEP_TAIL = 2  # 保留的末幾筆資料列
+MIN_CSV_DROP = 4  # 至少要丟這麼多列才值得壓（否則 marker 開銷蓋過收益）
+
+
+def _csv_rows(text: str) -> list[str] | None:
+    """判斷是否為乾淨表格：回 clean 行序列（含表頭）或 None。
+
+    條件：去單一尾端換行後行數 >= MIN_CSV_LINES、無內部空行、且存在某 delimiter
+    （`,` 優先、再 `\t`）讓「每一行」出現次數相同且 >= 1。delimiter 計數純 ASCII byte
+    （str.count 對單 ASCII 字元 == byte 計數，與 Rust 逐字節對齊）。
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]  # 容忍單一尾端換行
+    if len(lines) < MIN_CSV_LINES:
+        return None
+    if any(line == "" for line in lines):
+        return None  # 內部空行 → 非乾淨表格，落 truncate 兜底
+    for delim in (",", "\t"):
+        c0 = lines[0].count(delim)
+        if c0 >= 1 and all(line.count(delim) == c0 for line in lines):
+            return lines
+    return None
+
+
+def _csv_squeeze_core(text: str) -> str | None:
+    """純函式：保表頭 + 頭尾資料列、中段塞 marker。壓不動回 None。"""
+    lines = _csv_rows(text)
+    if lines is None:
+        return None
+    dropped = (len(lines) - 1) - CSV_KEEP_HEAD - CSV_KEEP_TAIL
+    if dropped < MIN_CSV_DROP:
+        return None
+    digest = content_key(text)
+    header = lines[0]
+    head = lines[1 : 1 + CSV_KEEP_HEAD]
+    tail = lines[len(lines) - CSV_KEEP_TAIL :]
+    marker = f"[... headroom-lite dropped {dropped} table rows | sha256:{digest} ...]"
+    return "\n".join([header, *head, marker, *tail])
+
+
+def _csv_applies(text: str) -> bool:
+    """嗅探：是乾淨表格、且中段可丟列數夠多（>= MIN_CSV_DROP）才認領。"""
+    return _csv_squeeze_core(text) is not None
+
+
+def _csv_squeeze(text: str, store=None) -> str:
+    """保表頭 + 頭尾列；壓不動 → 原文回、絕不 put（神聖時機契約）。"""
+    out = _csv_squeeze_core(text)
+    if out is None:
+        return text
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    return out
+
+
+# csv 排在 stacktrace 之後、truncate 之前：表格無 JSON/diff/search/log/frame 結構 → 不被
+# 前面策略認領、落到此；既有 fixture 已由前面策略接走，csv 只接純表格 → 零回歸。
+CSV = Strategy("csv", _csv_applies, _csv_squeeze)
+
+# 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/csv 先嗅探，不命中才落 truncate 兜底。
+STRATEGIES: tuple[Strategy, ...] = (JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE)
 
 
 def squeeze_text(text: str, store=None, strategies: tuple[Strategy, ...] = STRATEGIES) -> str:
