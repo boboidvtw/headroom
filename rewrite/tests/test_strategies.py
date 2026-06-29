@@ -782,3 +782,100 @@ def test_md_registered_before_csv():
     names = [s.name for s in STRATEGIES]
     assert names.index("stacktrace") < names.index("markdown") < names.index("csv")
     assert names.index("csv") < names.index("truncate")
+
+
+# ── M19：base64/hex blob 內容感知策略（與 Rust tests/strategies.rs 對稱）──
+from headroom_lite.strategies import (  # noqa: E402
+    BLOB,
+    BLOB_HEAD,
+    BLOB_TAIL,
+    _blob_squeeze,
+)
+
+_B64_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+)
+
+
+def _blob(n: int = 2000) -> str:
+    """data URI，內含 n 字元的確定性 base64 payload（單行、無換行/空白）。"""
+    payload = "".join(_B64_ALPHABET[i % len(_B64_ALPHABET)] for i in range(n))
+    return f"data:image/png;base64,{payload}"
+
+
+def test_blob_applies_on_data_uri():
+    assert BLOB.applies(_blob(2000)) is True
+
+
+def test_blob_applies_false_on_short_run():
+    # payload 100 < MIN_BLOB_RUN(512) → 不認領。
+    assert BLOB.applies(_blob(100)) is False
+
+
+def test_blob_applies_false_on_prose():
+    # 散文含空白 → 連續 blob 串被打斷，無 512 字元長串。
+    prose = " ".join(_B64_ALPHABET for _ in range(60))  # 每段 64 字元、被空白隔開
+    assert BLOB.applies(prose) is False
+
+
+def test_blob_applies_false_on_non_ascii():
+    # 非 ASCII → 無法保證 char index == byte index → 不認領（落 truncate）。
+    text = "中文" + ("A" * 2000) + "中文"
+    assert BLOB.applies(text) is False
+
+
+def test_blob_squeeze_keeps_head_tail():
+    text = _blob(2000)
+    out = _blob_squeeze(text)
+    # 非 blob 前綴（data URI scheme）照抄保留。
+    assert out.startswith("data:image/png;base64,")
+    assert "blob chars" in out
+    # 輸出遠短於原文（中段被丟）。
+    assert len(out) < len(text)
+    # 輸出結構精確 = 前綴 + blob 頭 + marker + blob 尾（中段 1872 字元被收斂掉）。
+    prefix = "data:image/png;base64,"
+    payload = text[len(prefix):]
+    dropped = len(payload) - BLOB_HEAD - BLOB_TAIL
+    marker = f"[... headroom-lite dropped {dropped} blob chars | sha256:{content_key(text)} ...]"
+    assert out == prefix + payload[:BLOB_HEAD] + marker + payload[-BLOB_TAIL:]
+
+
+def test_blob_marker_has_count_and_key():
+    text = _blob(2000)
+    out = squeeze_text(text)
+    assert f"sha256:{content_key(text)}" in out
+    assert "dropped 1872 blob chars" in out  # 2000 - 64 - 64 = 1872
+
+
+def test_blob_deterministic():
+    text = _blob(2000)
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_blob_stores_original_before_squeezing():
+    store = _SpyStore()
+    text = _blob(2000)
+    squeeze_text(text, store=store)
+    assert store.puts == [text]
+
+
+def test_blob_no_compress_returns_text_without_put():
+    # run 太短 → 原文回、絕不 put（神聖時機契約）。
+    store = _SpyStore()
+    text = _blob(100)
+    assert _blob_squeeze(text, store) == text
+    assert store.puts == []
+
+
+def test_blob_does_not_swallow_other_strategies():
+    # 不回歸：log/diff/search/csv/markdown 含空白/標點 → 無 512 連續 blob 串。
+    assert BLOB.applies(_noisy_log()) is False
+    assert BLOB.applies(_diff()) is False
+    assert BLOB.applies(_search()) is False
+    assert BLOB.applies(_csv_table(40)) is False
+    assert BLOB.applies(_md_table(40)) is False
+
+
+def test_blob_registered_after_csv_before_truncate():
+    names = [s.name for s in STRATEGIES]
+    assert names.index("csv") < names.index("blob") < names.index("truncate")

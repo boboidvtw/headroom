@@ -744,8 +744,113 @@ def _md_squeeze(text: str, store=None) -> str:
 # fixture 無 pipe → markdown 不認領、零回歸。
 MARKDOWN = Strategy("markdown", _md_applies, _md_squeeze)
 
-# 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/markdown/csv 先嗅探，不命中才落 truncate 兜底。
-STRATEGIES: tuple[Strategy, ...] = (JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, TRUNCATE)
+
+# ── M19 — base64/hex blob 內容感知策略（第八片；首片「字元範圍」壓縮）──
+#
+# 對象：單行巨型編碼 blob（data URI 內嵌圖片、base64 編碼附件、長 hex dump、JWT 等）。LLM
+# context 裡這類 blob 動輒數千字元、token 爆量，但中段對推理是不透明噪音；保頭尾足以辨識，
+# 中段交給 CCR store 可逆取回。
+#
+# ⭐ 與前七片的根本差別：這是**第一片「字元範圍（intra-line）」策略** —— 前七片全是「行級 /
+# array 元素級」丟整段；blob 策略在「一行之內」按字元偏移切頭尾。手法：找最長的「連續 blob
+# 字元串」（base64/base64url/hex 字元集，**不含換行/空白** = 單一 token），保前 BLOB_HEAD +
+# 後 BLOB_TAIL 字元、中段塞 marker，串外 bytes 照抄。
+#
+# ⭐ parity 正解：字元範圍切片在 Python（依 code point）與 Rust（依 byte）天生會分岔 —— 解法是
+# **要求整段 text 為純 ASCII**（`text.isascii()`）。ASCII 下 code point 與 byte 一對一，兩語言
+# 切片偏移完全一致；非 ASCII 一律不認領、落 truncate 兜底（保守、安全）。blob 本就純 ASCII。
+#
+# 嗅探（保守、強訊號防誤判）：連續 blob 字元串（無空白/換行/標點打斷）須 >= MIN_BLOB_RUN。散文
+# 不可能有 512 字元不含空白的連續串；含標點的 minified 程式碼、URL 也會被 `.;,?&{}()` 等非 blob
+# 字元打斷。tie-break 取最長；同長取最前（嚴格大於才替換）→ Py/Rs 一致。
+#
+# 限制（誠實記錄）：只認單行 blob（run 不跨換行）→ MIME/PEM 換行折疊的多行 base64 不認領，
+# 留作未來擴充。收存點對稱 M15/M17：核心純函式回 Option、put 在呼叫端（_blob_squeeze）。
+
+MIN_BLOB_RUN = 512  # 連續 blob 字元串長度下限 —— 低於此不認領（保守防誤判）
+BLOB_HEAD = 64  # 保留 blob 開頭字元數
+BLOB_TAIL = 64  # 保留 blob 結尾字元數
+
+
+def _is_blob_char(b: int) -> bool:
+    """base64 / base64url / hex 字元集：ASCII 英數 + `+` `/` `=` `_` `-`（純 byte，parity 安全）。"""
+    return (
+        0x30 <= b <= 0x39  # 0-9
+        or 0x41 <= b <= 0x5A  # A-Z
+        or 0x61 <= b <= 0x7A  # a-z
+        or b in (0x2B, 0x2F, 0x3D, 0x5F, 0x2D)  # + / = _ -
+    )
+
+
+def _longest_blob_run(data: bytes) -> tuple[int, int]:
+    """回最長連續 blob 字元串的 (start, end)；無則 (0, 0)。同長取最前（嚴格大於才替換）。"""
+    best_s = best_e = 0
+    i, n = 0, len(data)
+    while i < n:
+        if _is_blob_char(data[i]):
+            j = i
+            while j < n and _is_blob_char(data[j]):
+                j += 1
+            if (j - i) > (best_e - best_s):
+                best_s, best_e = i, j
+            i = j
+        else:
+            i += 1
+    return best_s, best_e
+
+
+def _blob_squeeze_core(text: str) -> str | None:
+    """純函式：找最長 blob 串、保頭尾字元、中段塞 marker。壓不動回 None。
+
+    非 ASCII 一律回 None —— 字元範圍切片需 code point == byte 才能 Py/Rs 一致。
+    """
+    if not text.isascii():
+        return None
+    data = text.encode("ascii")  # ASCII 下 byte index == char index → 切片偏移兩語言一致
+    start, end = _longest_blob_run(data)
+    run_len = end - start
+    if run_len < MIN_BLOB_RUN:  # MIN_BLOB_RUN > HEAD+TAIL → dropped 必為正、無下溢
+        return None
+    dropped = run_len - BLOB_HEAD - BLOB_TAIL
+    digest = content_key(text)
+    marker = f"[... headroom-lite dropped {dropped} blob chars | sha256:{digest} ...]"
+    head = text[start : start + BLOB_HEAD]
+    tail = text[end - BLOB_TAIL : end]
+    return text[:start] + head + marker + tail + text[end:]
+
+
+def _blob_applies(text: str) -> bool:
+    """嗅探：純 ASCII、且最長連續 blob 串 >= MIN_BLOB_RUN 才認領。"""
+    return _blob_squeeze_core(text) is not None
+
+
+def _blob_squeeze(text: str, store=None) -> str:
+    """保 blob 頭尾字元；壓不動 → 原文回、絕不 put（神聖時機契約）。"""
+    out = _blob_squeeze_core(text)
+    if out is None:
+        return text
+    if store is not None:
+        store.put(text)  # 產出有損輸出前先收存原文 —— 永不丟資料
+    return out
+
+
+# blob 排在 csv 之後、truncate 之前：極專一（需 512 字元連續 blob 串 + 純 ASCII），排最末才
+# 安全；單行 blob 無換行 → log/search/csv/markdown/stacktrace（皆需多行）全不認領、diff 需 @@、
+# json 需 `[`/`{` 開頭 → 都讓過，blob 接住「否則落 truncate 卻因單行無法壓」的巨型 blob。
+BLOB = Strategy("blob", _blob_applies, _blob_squeeze)
+
+# 策略註冊表：按優先序排列。json/diff/search/log/stacktrace/markdown/csv/blob 先嗅探，不命中才落 truncate 兜底。
+STRATEGIES: tuple[Strategy, ...] = (
+    JSON,
+    DIFF,
+    SEARCH,
+    LOG,
+    STACKTRACE,
+    MARKDOWN,
+    CSV,
+    BLOB,
+    TRUNCATE,
+)
 
 
 def squeeze_text(text: str, store=None, strategies: tuple[Strategy, ...] = STRATEGIES) -> str:

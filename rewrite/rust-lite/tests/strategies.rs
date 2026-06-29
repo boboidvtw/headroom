@@ -9,8 +9,8 @@
 
 use headroom_lite_rs::ccr::content_key;
 use headroom_lite_rs::strategies::{
-    squeeze_text, squeeze_text_with, Strategy, CSV, DIFF, HEAD_LINES, JSON, LOG, MARKDOWN, SEARCH,
-    STACKTRACE, STRATEGIES, TAIL_LINES, TRUNCATE,
+    squeeze_text, squeeze_text_with, Strategy, BLOB, CSV, DIFF, HEAD_LINES, JSON, LOG, MARKDOWN,
+    SEARCH, STACKTRACE, STRATEGIES, TAIL_LINES, TRUNCATE,
 };
 
 fn long_text() -> String {
@@ -785,5 +785,100 @@ fn md_registered_before_csv() {
 #[test]
 fn md_deterministic() {
     let text = md_table(40);
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
+
+// ── M19：base64/hex blob 內容感知策略（對齊 Python test_strategies.py）──
+
+const B64_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// data URI，內含 n 字元的確定性 base64 payload（單行、無換行/空白）。
+fn blob_uri(n: usize) -> String {
+    let payload: String = (0..n).map(|i| B64_ALPHABET[i % B64_ALPHABET.len()] as char).collect();
+    format!("data:image/png;base64,{payload}")
+}
+
+#[test]
+fn blob_applies_on_data_uri() {
+    assert!((BLOB.applies)(&blob_uri(2000)));
+}
+
+#[test]
+fn blob_applies_false_on_short_run() {
+    // payload 100 < MIN_BLOB_RUN(512) → 不認領。
+    assert!(!(BLOB.applies)(&blob_uri(100)));
+}
+
+#[test]
+fn blob_applies_false_on_prose() {
+    // 散文含空白 → 連續 blob 串被打斷，無 512 字元長串。
+    let seg = std::str::from_utf8(B64_ALPHABET).unwrap();
+    let prose = vec![seg; 60].join(" ");
+    assert!(!(BLOB.applies)(&prose));
+}
+
+#[test]
+fn blob_applies_false_on_non_ascii() {
+    // 非 ASCII → 無法保證 char index == byte index → 不認領。
+    let text = format!("中文{}中文", "A".repeat(2000));
+    assert!(!(BLOB.applies)(&text));
+}
+
+#[test]
+fn blob_squeeze_keeps_head_tail() {
+    let text = blob_uri(2000);
+    let out = (BLOB.squeeze)(&text).expect("blob 該壓");
+    assert!(out.starts_with("data:image/png;base64,"));
+    assert!(out.contains("blob chars"));
+    assert!(out.len() < text.len());
+    // 輸出結構精確 = 前綴 + blob 頭 + marker + blob 尾。
+    let prefix = "data:image/png;base64,";
+    let payload = &text[prefix.len()..];
+    let dropped = payload.len() - 64 - 64;
+    let marker = format!(
+        "[... headroom-lite dropped {dropped} blob chars | sha256:{} ...]",
+        content_key(&text)
+    );
+    let expected = format!("{prefix}{}{marker}{}", &payload[..64], &payload[payload.len() - 64..]);
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn blob_marker_has_count_and_key() {
+    let text = blob_uri(2000);
+    let out = squeeze_text(&text).expect("blob 該壓");
+    assert!(out.contains(&format!("sha256:{}", content_key(&text))));
+    assert!(out.contains("dropped 1872 blob chars")); // 2000 - 64 - 64 = 1872
+}
+
+#[test]
+fn blob_no_compress_returns_none() {
+    // 防禦性：squeeze 直呼但 run 太短 → None（呼叫端保留原文、不 put）。
+    assert_eq!((BLOB.squeeze)(&blob_uri(100)), None);
+}
+
+#[test]
+fn blob_does_not_swallow_other_strategies() {
+    // 不回歸：log/diff/search/csv/markdown 含空白/標點 → 無 512 連續 blob 串。
+    assert!(!(BLOB.applies)(&noisy_log()));
+    assert!(!(BLOB.applies)(&diff()));
+    assert!(!(BLOB.applies)(&search_default()));
+    assert!(!(BLOB.applies)(&csv_table(40)));
+    assert!(!(BLOB.applies)(&md_table(40)));
+}
+
+#[test]
+fn blob_registered_after_csv_before_truncate() {
+    let names: Vec<&str> = STRATEGIES.iter().map(|s| s.name).collect();
+    let c = names.iter().position(|&n| n == "csv").unwrap();
+    let b = names.iter().position(|&n| n == "blob").unwrap();
+    let t = names.iter().position(|&n| n == "truncate").unwrap();
+    assert!(c < b && b < t, "順序須為 csv < blob < truncate");
+}
+
+#[test]
+fn blob_deterministic() {
+    let text = blob_uri(2000);
     assert_eq!(squeeze_text(&text), squeeze_text(&text));
 }
