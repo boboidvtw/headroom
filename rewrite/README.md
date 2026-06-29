@@ -46,6 +46,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M15 | _local_ | fourth content-aware strategy: **json compression** | find the largest JSON array, keep first 5 + last 2 elements, splice a marker string element in between (result stays valid JSON), copy everything outside the array verbatim; marker = `dropped N array elements` + `content_key`. The headline lesson is the parity insight: the obvious approach — parse, truncate, re-serialize — hits the number-reserialization landmine (`json.dumps` normalizes `1.10`→`1.1`, but Rust's `arbitrary_precision` keeps `1.10` → divergence). The fix is to **never re-serialize any value**: a byte-level structural scan (tracking string literals and nesting depth) records element byte-spans, and kept elements are copied as raw byte slices — only the structural chars (`[` `,` `]`) and the marker are newly written, all ASCII constants. So Python and Rust can't diverge on values. Determinism: tie-break is most-elements-then-smallest-start (Python `max` keeps first on ties, Rust `max_by_key` keeps last, so both use explicit "strictly-greater replaces"). Guarded to genuine JSON documents (first non-whitespace byte is `[`/`{`) so bracket-containing prose/logs aren't mistaken for JSON. Registered first. New `09_json.json` fixture deliberately includes `1.10` and `1e10`: 2959→**1651** bytes, byte-for-byte across languages with the tricky numbers preserved verbatim |
 | M16 | _local_ | fifth content-aware strategy: **stack trace compression** | segment a stack trace into frames (Python `File "..."`, Java/JS `at ...(`), keep the first 3 + last 3 frames, drop the middle frames (with their continuation lines), keep **every non-frame line** (the `Traceback` header, the final `XxxError: msg`, chained-exception separators); marker = `dropped N stack frames` + `content_key`. Beats blind truncation on frame integrity: truncate cuts at a line boundary and can split a `File "..."` header from its code line, and a multi-line trailing message can push the crucial error line out of the tail window — the frame-aware strategy never splits a frame and always keeps the message lines. A frame header is detected byte-level (strip leading `0x20`/`0x09`, then `File "` or `at ` + `(`) — the `(` requirement rejects prose like "at the store". Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE)` — just before TRUNCATE, so every existing fixture is claimed by an earlier strategy first (zero regression by construction; a pure stack trace has no `INFO/DEBUG` noise so log never claims it). Determinism via in-order frame segmentation + index math (no hash-order dependence), Py/Rs byte-identical. New `10_stacktrace.json` fixture (30-frame recursion trace): 2906→**1386** bytes through the full pipeline, cross-language byte-for-byte |
 | M17 | `b6fa1a0` | sixth content-aware strategy: **CSV/table compression** | keep the header row + first 3 + last 2 data rows, collapse the middle homogeneous rows into a single marker (`dropped N table rows` + `content_key`). Beats blind truncation on semantics: truncate doesn't know "the header is the signal" — once data rows are numerous enough to push the column names out of the `HEAD_LINES` window the names are lost and the remaining number rows are unreadable; the CSV strategy pins the header to line 0. Detection is conservative/strong-signal: after dropping a single trailing newline, **every** non-empty line must contain the same delimiter (`,` preferred, then `\t`) the same number of times (≥1) — prose can't have an identical comma count on every line; an interior blank line or a quoted-comma (which breaks the equal-count invariant) falls through to truncate. Delimiter counting is pure ASCII byte counting (`,`=0x2C/`\t`=0x09 are never UTF-8 continuation bytes) ⇒ identical to Python `str.count`. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE)` — just before the catch-all, so every existing fixture is claimed earlier (zero regression: all 10 prior fixtures keep their exact byte counts). New `11_csv.json` fixture (60-row table): 3533→**1095** bytes through the full pipeline, cross-language byte-for-byte |
+| M18 | `10e3522b` | seventh content-aware strategy: **Markdown table compression** | keep the header row + the **separator row** (`\|---\|---\|`) + first 3 + last 2 data rows, collapse the middle homogeneous rows into a single marker (`dropped N markdown table rows` + `content_key`). Distinct from CSV (M17), not just a different delimiter: a markdown table has an extra **separator row** that must be pinned — it defines column alignment and is a required part of a valid GFM table, and blind truncation would push both the header and separator out of the window. Detection is conservative/strong-signal: after dropping a single trailing newline, **every** line must contain the same number (≥1) of `\|`, **and** the second line must be a valid separator (only `\|`, `:`, `-`, space, with at least one `-`). The separator row is the key discriminator from CSV/prose — CSV data has no pipes, prose has neither an identical pipe count nor a separator row. Pipe/separator counting is pure ASCII byte counting (`\|`=0x7C/`-`=0x2D/`:`=0x3A are never UTF-8 continuation bytes) ⇒ identical to Python `str.count`. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, TRUNCATE)` — markdown before csv (more specific; the two are mutually exclusive, pipe vs comma), so a genuine markdown table is never grabbed by csv; the existing csv fixture has no pipes so markdown doesn't claim it (zero regression: all 10 prior fixtures keep their exact byte counts). New `12_markdown.json` fixture (40-row table): 3121→**1262** bytes through the full pipeline, cross-language byte-for-byte |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -310,16 +311,57 @@ delimiter 計數是純 ASCII byte 計數（`,` 與 `\t` 皆非 UTF-8 續位元�
 既有 fixture 都被前面策略先接走——靠註冊順序保證零回歸（既有 10 fixture 位元數全不變）。
 新增的 `11_csv.json` fixture——60 列表格——走完整 pipeline 壓 3533→1095 bytes、兩語言逐字節一致。
 
+## Notes — M18 (2026-06-29)
+
+M18 added the **seventh content-aware strategy**: Markdown table compression. It keeps
+the header row, the **separator row** (`|---|---|`), and the first 3 + last 2 data rows,
+collapsing the middle homogeneous rows into a single marker (`dropped N markdown table
+rows` + `content_key`). This is distinct from CSV (M17), not merely a different
+delimiter: a markdown table carries an extra separator row that must be pinned — it
+defines column alignment and is required for a valid GFM table, and blind truncation
+would push both the header and the separator out of the window. Detection is
+deliberately conservative/strong-signal: after dropping a single trailing newline,
+**every** line must contain the same number (≥1) of `|`, **and** the second line must be
+a valid separator (composed only of `|`, `:`, `-`, space, with at least one `-`). The
+separator row is the key discriminator from CSV and prose — CSV data has no pipes, and
+prose has neither an identical pipe count on every line nor a separator row. Pipe and
+separator counting is pure ASCII byte counting (`|`/`-`/`:` are never UTF-8 continuation
+bytes), byte-identical to Python's `str.count`; the Rust side guards `data_rows <
+HEAD+TAIL+MIN_DROP` first to avoid a usize underflow. It registers `(JSON, DIFF, SEARCH,
+LOG, STACKTRACE, MARKDOWN, CSV, TRUNCATE)` — markdown before csv (the more specific
+signal; the two are mutually exclusive, pipe vs comma), so a genuine markdown table is
+never grabbed by csv, and the existing csv fixture has no pipes so markdown leaves it
+alone — zero regression (all 10 prior fixtures keep their exact byte counts). The new
+`12_markdown.json` fixture — a 40-row table — compresses 3121→1262 bytes through the
+full pipeline, byte-for-byte across both languages.
+
+## Notes — M18（2026-06-29）
+
+M18 接上**第七片內容感知策略**：Markdown table 壓縮。它保留表頭列、**分隔列**
+（`|---|---|`）+ 前 3 + 後 2 筆資料列，把中段同構資料列收斂成單一 marker
+（`dropped N markdown table rows` + `content_key`）。與 CSV（M17）的差別不只是換
+delimiter：markdown 表格多一條分隔列必須釘住保留——它定義欄位對齊、是合法 GFM 表格
+的必要結構，盲截斷會把表頭與分隔列一起擠出視窗。嗅探刻意保守、強訊號：去掉單一尾端
+換行後，**每一行**都必須含相同數量（≥1）的 `|`，**且**第二行是合法分隔列（只由 `|`、
+`:`、`-`、空白組成且至少一個 `-`）。分隔列是與 CSV/散文的關鍵鑑別子——CSV 資料無 pipe，
+散文既不會每行 pipe 數一致、也沒有分隔列。pipe 與分隔列計數是純 ASCII byte 計數
+（`|`/`-`/`:` 皆非 UTF-8 續位元組），與 Python `str.count` 逐字節一致；Rust 側先擋
+`data_rows < HEAD+TAIL+MIN_DROP` 以避 usize 下溢。註冊 `(JSON, DIFF, SEARCH, LOG,
+STACKTRACE, MARKDOWN, CSV, TRUNCATE)`——markdown 排 csv 前（更專一的訊號；兩者 pipe vs
+逗號互斥），所以真 markdown 表格不會被 csv 誤搶，既有 csv fixture 無 pipe → markdown
+不認領——零回歸（既有 10 fixture 位元數全不變）。新增的 `12_markdown.json` fixture——
+40 列表格——走完整 pipeline 壓 3121→1262 bytes、兩語言逐字節一致。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 118 tests
+cd rewrite && uv run pytest -q              # 130 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 121 tests
+cd rewrite/rust-lite && cargo test          # 132 tests
 
-# Cross-language parity gate / 跨語言 parity gate（11 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（12 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
