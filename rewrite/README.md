@@ -48,6 +48,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M17 | `b6fa1a0` | sixth content-aware strategy: **CSV/table compression** | keep the header row + first 3 + last 2 data rows, collapse the middle homogeneous rows into a single marker (`dropped N table rows` + `content_key`). Beats blind truncation on semantics: truncate doesn't know "the header is the signal" — once data rows are numerous enough to push the column names out of the `HEAD_LINES` window the names are lost and the remaining number rows are unreadable; the CSV strategy pins the header to line 0. Detection is conservative/strong-signal: after dropping a single trailing newline, **every** non-empty line must contain the same delimiter (`,` preferred, then `\t`) the same number of times (≥1) — prose can't have an identical comma count on every line; an interior blank line or a quoted-comma (which breaks the equal-count invariant) falls through to truncate. Delimiter counting is pure ASCII byte counting (`,`=0x2C/`\t`=0x09 are never UTF-8 continuation bytes) ⇒ identical to Python `str.count`. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE)` — just before the catch-all, so every existing fixture is claimed earlier (zero regression: all 10 prior fixtures keep their exact byte counts). New `11_csv.json` fixture (60-row table): 3533→**1095** bytes through the full pipeline, cross-language byte-for-byte |
 | M18 | `10e3522b` | seventh content-aware strategy: **Markdown table compression** | keep the header row + the **separator row** (`\|---\|---\|`) + first 3 + last 2 data rows, collapse the middle homogeneous rows into a single marker (`dropped N markdown table rows` + `content_key`). Distinct from CSV (M17), not just a different delimiter: a markdown table has an extra **separator row** that must be pinned — it defines column alignment and is a required part of a valid GFM table, and blind truncation would push both the header and separator out of the window. Detection is conservative/strong-signal: after dropping a single trailing newline, **every** line must contain the same number (≥1) of `\|`, **and** the second line must be a valid separator (only `\|`, `:`, `-`, space, with at least one `-`). The separator row is the key discriminator from CSV/prose — CSV data has no pipes, prose has neither an identical pipe count nor a separator row. Pipe/separator counting is pure ASCII byte counting (`\|`=0x7C/`-`=0x2D/`:`=0x3A are never UTF-8 continuation bytes) ⇒ identical to Python `str.count`. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, TRUNCATE)` — markdown before csv (more specific; the two are mutually exclusive, pipe vs comma), so a genuine markdown table is never grabbed by csv; the existing csv fixture has no pipes so markdown doesn't claim it (zero regression: all 10 prior fixtures keep their exact byte counts). New `12_markdown.json` fixture (40-row table): 3121→**1262** bytes through the full pipeline, cross-language byte-for-byte |
 | M19 | `7fe44e8b` | eighth content-aware strategy (first **character-range**): **base64/hex blob compression** | the first intra-line strategy — the prior seven all drop whole lines or array elements; this one slices head/tail *within a line* by character offset. Finds the longest contiguous run of blob characters (base64/base64url/hex set, **no newlines or spaces** ⇒ a single token, targeting single-line data URIs), keeps the first 64 + last 64 characters, splices a marker (`dropped N blob chars` + `content_key`) into the middle, copies the rest of the text verbatim. **Parity key:** character-range slicing diverges between Python (code points) and Rust (bytes), so the strategy **requires the whole text to be ASCII** (`isascii`/`is_ascii`) — under ASCII, code point == byte, so both languages slice at identical offsets; non-ASCII is never claimed (falls through to truncate), and blobs are ASCII anyway. Detection is conservative/strong-signal: the contiguous run must be ≥512 chars — prose can't hold 512 chars with no spaces, and minified code/URLs are broken by `.;,?&{}()`. Limitation (honest): single-line blobs only (the run doesn't cross newlines); MIME/PEM line-wrapped base64 is a future extension. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, BLOB, TRUNCATE)` — last before the catch-all (very specific), so a single-line blob (no newlines) is claimed by no multi-line strategy and blob catches what would otherwise fall to truncate yet can't be compressed as one line (zero regression: all 12 prior fixtures keep their exact byte counts). New `13_blob.json` fixture (2600-char data URI): 2950→**948** bytes through the full pipeline, cross-language byte-for-byte |
+| M20 | `11103a5b` | ninth content-aware strategy: **HTML/XML compression** | keep the markup structure and visible text, replace the inner content of `<script>`/`<style>` elements and `<!-- -->` comments with a marker (`dropped N html noise chars` + `content_key`). Beats blind truncation on semantics: truncate doesn't know a giant inline JS bundle is noise while structure and text are signal — once the scripts are big enough they push the real page content out of the window; HTML surgically removes only script/style/comment inner content. **Parity key (reuses the M15 JSON approach, non-ASCII safe):** Python finds/slices by **character index**, Rust by **byte index** — each indexes natively into the same logical positions (the same `<script>`, the same `>`), so the extracted logical substrings match and the output bytes are identical. This means non-ASCII text content (e.g. a Chinese page) is preserved verbatim and byte-for-byte across both languages (`14_html.json` contains Chinese). Tag names are matched lowercase only (conservative; dodges the unicode-`lower()` length-shift index trap), and every cut lands on an ASCII tag boundary so UTF-8 is never split. Registered `(..., CSV, HTML, BLOB, TRUNCATE)` — HTML before blob (a page with inline script routes to HTML and keeps its structure rather than being swallowed by blob as one giant run; a data URI has no `<script>` so it falls to blob). Existing fixtures have no noise regions ⇒ zero regression (all 13 prior fixtures keep their exact byte counts). New `14_html.json` fixture (scraped page with inline script+style+comment, Chinese body): 5760→**1244** bytes through the full pipeline, cross-language byte-for-byte |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -393,16 +394,57 @@ bytes 照抄。parity 正解：字元範圍切片在 Python（依 code point）�
 無法壓」的巨型 blob——零回歸（既有 12 fixture 位元數全不變）。新增的 `13_blob.json`
 fixture——2600 字元 data URI——走完整 pipeline 壓 2950→948 bytes、兩語言逐字節一致。
 
+## Notes — M20 (2026-06-29)
+
+M20 added the **ninth content-aware strategy**: HTML/XML compression. It keeps the
+markup structure and the visible text, and replaces the inner content of `<script>` and
+`<style>` elements (and `<!-- -->` comments) with a marker (`dropped N html noise chars`
++ `content_key`). The win over blind truncation is semantic: truncate doesn't know that
+a giant inline JS bundle is noise while the structure and text are signal — once the
+scripts are large enough they push the real page content out of the window; the HTML
+strategy surgically removes only script/style/comment inner content and keeps the
+boundaries and text. The parity key reuses the M15 JSON approach and is non-ASCII safe:
+Python finds and slices by **character index** while Rust uses **byte index** — each
+indexes natively into the same logical positions (the same `<script>`, the same `>`), so
+the extracted logical substrings are identical and the output bytes match. Non-ASCII
+text content (a Chinese page, say) is therefore preserved verbatim and byte-for-byte
+across both languages (`14_html.json` carries a Chinese body). Tag names are matched
+lowercase only — conservative, and it dodges the unicode-`lower()` length-shift index
+trap — and every cut lands on an ASCII tag boundary so UTF-8 is never split. It registers
+`(..., CSV, HTML, BLOB, TRUNCATE)`: HTML before blob, so a page with an inline script
+routes to HTML and keeps its structure instead of being swallowed by blob as one giant
+run, while a data URI (no `<script>`) falls through to blob. Existing fixtures have no
+noise regions, so there is zero regression (all 13 prior fixtures keep their exact byte
+counts). The new `14_html.json` fixture — a scraped page with inline script, style, and
+a comment, plus a Chinese body — compresses 5760→1244 bytes through the full pipeline,
+byte-for-byte across both languages.
+
+## Notes — M20（2026-06-29）
+
+M20 接上**第九片內容感知策略**：HTML/XML 壓縮。它保留標籤結構與可見文字，把 `<script>`、
+`<style>` 元素的內文與 `<!-- -->` 註解換成一個 marker（`dropped N html noise chars` +
+`content_key`）。勝過盲截斷的點是語意：truncate 不懂「巨型 inline JS 是噪音、結構與文字才是
+訊號」——script 一大就把頁面真正內容擠出視窗；HTML 策略精準只挖 script/style/comment 內文、
+保住邊界與文字。parity 正解沿用 M15 JSON 模式、非 ASCII 安全：Python 用 **char index**
+find/slice、Rust 用 **byte index**，各自原生索引定位同一邏輯位置（同一個 `<script>`、同一個
+`>`）→ 切出的邏輯子字串相同、輸出 bytes 一致。所以中文網頁等非 ASCII 文字內容逐字保留、兩
+語言逐字節一致（`14_html.json` 帶中文 body）。標籤名只比對小寫（保守，且避開 unicode
+`lower()` 改變長度的 index 陷阱），切點都落在 ASCII 標籤邊界 → 不破 UTF-8。註冊
+`(..., CSV, HTML, BLOB, TRUNCATE)`：HTML 排 blob 前，含 inline script 的頁面走 HTML 保結構、
+不被 blob 當一條巨串吞掉；data URI（無 `<script>`）則落 blob。既有 fixture 皆無噪音區 → 零
+回歸（既有 13 fixture 位元數全不變）。新增的 `14_html.json` fixture——帶 inline
+script+style+註解、且 body 為中文的爬取頁面——走完整 pipeline 壓 5760→1244 bytes、兩語言逐字節一致。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 141 tests
+cd rewrite && uv run pytest -q              # 154 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 142 tests
+cd rewrite/rust-lite && cargo test          # 154 tests
 
-# Cross-language parity gate / 跨語言 parity gate（13 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（14 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
