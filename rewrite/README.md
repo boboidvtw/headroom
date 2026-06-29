@@ -45,6 +45,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M14 | _local_ | third content-aware strategy: **search compression** | grep/rg `file:lineno:content` output — cap matches per file (keep first 3, drop the rest), marker = `dropped N search result lines` + `content_key`. The teaching landmine: detecting a match line by "`:`-split, second field all digits" also matches log timestamps (`10:30:45` is literally `field:digits:field`) — so search would cannibalize logs. Fix: require the file_key (before the first `:`) to contain a `/`; real `grep -rn pat .` always carries a path (`./src/foo.py:12:`), a timestamp prefix (`2026-06-20T10`) never does — a pure ASCII byte check, identical across languages. Registered `(DIFF, SEARCH, LOG, TRUNCATE)`: grep-over-logs routes to search, but existing logs have no `/`-bearing `file:line:` lines so they still route to log (no M12 regression). Determinism via in-order scan + per-file counts (HashMap looked up, never iterated → no hash-order dependence). New `08_search.json` fixture: 4289→**1702** bytes, byte-for-byte |
 | M15 | _local_ | fourth content-aware strategy: **json compression** | find the largest JSON array, keep first 5 + last 2 elements, splice a marker string element in between (result stays valid JSON), copy everything outside the array verbatim; marker = `dropped N array elements` + `content_key`. The headline lesson is the parity insight: the obvious approach — parse, truncate, re-serialize — hits the number-reserialization landmine (`json.dumps` normalizes `1.10`→`1.1`, but Rust's `arbitrary_precision` keeps `1.10` → divergence). The fix is to **never re-serialize any value**: a byte-level structural scan (tracking string literals and nesting depth) records element byte-spans, and kept elements are copied as raw byte slices — only the structural chars (`[` `,` `]`) and the marker are newly written, all ASCII constants. So Python and Rust can't diverge on values. Determinism: tie-break is most-elements-then-smallest-start (Python `max` keeps first on ties, Rust `max_by_key` keeps last, so both use explicit "strictly-greater replaces"). Guarded to genuine JSON documents (first non-whitespace byte is `[`/`{`) so bracket-containing prose/logs aren't mistaken for JSON. Registered first. New `09_json.json` fixture deliberately includes `1.10` and `1e10`: 2959→**1651** bytes, byte-for-byte across languages with the tricky numbers preserved verbatim |
 | M16 | _local_ | fifth content-aware strategy: **stack trace compression** | segment a stack trace into frames (Python `File "..."`, Java/JS `at ...(`), keep the first 3 + last 3 frames, drop the middle frames (with their continuation lines), keep **every non-frame line** (the `Traceback` header, the final `XxxError: msg`, chained-exception separators); marker = `dropped N stack frames` + `content_key`. Beats blind truncation on frame integrity: truncate cuts at a line boundary and can split a `File "..."` header from its code line, and a multi-line trailing message can push the crucial error line out of the tail window — the frame-aware strategy never splits a frame and always keeps the message lines. A frame header is detected byte-level (strip leading `0x20`/`0x09`, then `File "` or `at ` + `(`) — the `(` requirement rejects prose like "at the store". Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE)` — just before TRUNCATE, so every existing fixture is claimed by an earlier strategy first (zero regression by construction; a pure stack trace has no `INFO/DEBUG` noise so log never claims it). Determinism via in-order frame segmentation + index math (no hash-order dependence), Py/Rs byte-identical. New `10_stacktrace.json` fixture (30-frame recursion trace): 2906→**1386** bytes through the full pipeline, cross-language byte-for-byte |
+| M17 | `b6fa1a0` | sixth content-aware strategy: **CSV/table compression** | keep the header row + first 3 + last 2 data rows, collapse the middle homogeneous rows into a single marker (`dropped N table rows` + `content_key`). Beats blind truncation on semantics: truncate doesn't know "the header is the signal" — once data rows are numerous enough to push the column names out of the `HEAD_LINES` window the names are lost and the remaining number rows are unreadable; the CSV strategy pins the header to line 0. Detection is conservative/strong-signal: after dropping a single trailing newline, **every** non-empty line must contain the same delimiter (`,` preferred, then `\t`) the same number of times (≥1) — prose can't have an identical comma count on every line; an interior blank line or a quoted-comma (which breaks the equal-count invariant) falls through to truncate. Delimiter counting is pure ASCII byte counting (`,`=0x2C/`\t`=0x09 are never UTF-8 continuation bytes) ⇒ identical to Python `str.count`. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE)` — just before the catch-all, so every existing fixture is claimed earlier (zero regression: all 10 prior fixtures keep their exact byte counts). New `11_csv.json` fixture (60-row table): 3533→**1095** bytes through the full pipeline, cross-language byte-for-byte |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -271,16 +272,54 @@ TRUNCATE)`、排在 catch-all 前，所以每個既有 fixture 都被前面的�
 分岔），故 Python 與 Rust 逐字節一致。新增的 `10_stacktrace.json` fixture——30 個 frame
 的 Python 遞迴 trace——走完整 pipeline 壓 2906→1386 bytes、兩語言逐字節一致。
 
+## Notes — M17 (2026-06-29)
+
+M17 added the **sixth content-aware strategy**: CSV/table compression. It keeps the
+header row plus the first 3 and last 2 data rows, and collapses the middle
+homogeneous rows into a single marker (`dropped N table rows` + `content_key`). The
+win over blind truncation is semantic: truncate doesn't understand that the header is
+the signal — once there are enough data rows to push the column names out of the
+`HEAD_LINES` window, the names are gone and the surviving number rows can't be read;
+the CSV strategy pins the header to output line 0 and pairs it with representative
+head/tail rows. Detection is deliberately conservative: after dropping a single
+trailing newline, **every** non-empty line must contain the same delimiter (`,`
+first, then `\t`) the same number of times (≥1) — prose can't keep an identical comma
+count on every line, so this strong-signal check rejects false positives; an interior
+blank line, or a quoted comma that breaks the equal-count invariant, simply falls
+through to truncate (conservative, acceptable). Delimiter counting is pure ASCII byte
+counting (`,` and `\t` are never UTF-8 continuation bytes), byte-identical to Python's
+`str.count`; the Rust side guards `data_rows < HEAD+TAIL+MIN_DROP` first to avoid a
+usize underflow. It registers `(JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE)`,
+just before the catch-all, so every existing fixture is claimed by an earlier strategy
+first — zero regression by construction (all 10 prior fixtures keep their exact byte
+counts). The new `11_csv.json` fixture — a 60-row table — compresses 3533→1095 bytes
+through the full pipeline, byte-for-byte across both languages.
+
+## Notes — M17（2026-06-29）
+
+M17 接上**第六片內容感知策略**：CSV/表格 壓縮。它保留表頭列 + 前 3 + 後 2 筆資料列，
+把中段同構資料列收斂成單一 marker（`dropped N table rows` + `content_key`）。勝過盲
+截斷的點是語意：truncate 不懂「表頭才是訊號」——資料列一多就把欄名擠出 `HEAD_LINES`
+視窗，欄名遺失後剩下的數字列全無法判讀；CSV 策略把表頭釘在輸出第 0 行、再配頭尾代表
+列。嗅探刻意保守：去掉單一尾端換行後，**每一**非空行都必須以同一 delimiter（`,` 優先、
+再 `\t`）出現相同次數且 ≥1——散文不可能每行逗號數都一致，這個強訊號檢查藉此擋掉誤判；
+內部空行、或破壞「每行同數」的引號內逗號，一律落 truncate 兜底（保守、可接受）。
+delimiter 計數是純 ASCII byte 計數（`,` 與 `\t` 皆非 UTF-8 續位元組），與 Python
+`str.count` 逐字節一致；Rust 側先擋 `data_rows < HEAD+TAIL+MIN_DROP` 以避 usize 下溢。
+註冊 `(JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE)`、排在 catch-all 前，所以每個
+既有 fixture 都被前面策略先接走——靠註冊順序保證零回歸（既有 10 fixture 位元數全不變）。
+新增的 `11_csv.json` fixture——60 列表格——走完整 pipeline 壓 3533→1095 bytes、兩語言逐字節一致。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 106 tests
+cd rewrite && uv run pytest -q              # 118 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 110 tests
+cd rewrite/rust-lite && cargo test          # 121 tests
 
-# Cross-language parity gate / 跨語言 parity gate（10 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（11 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
