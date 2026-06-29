@@ -47,6 +47,7 @@ prompt cache 靠逐字節前綴比對 —— 任何重新序列化都會讓 cach
 | M16 | _local_ | fifth content-aware strategy: **stack trace compression** | segment a stack trace into frames (Python `File "..."`, Java/JS `at ...(`), keep the first 3 + last 3 frames, drop the middle frames (with their continuation lines), keep **every non-frame line** (the `Traceback` header, the final `XxxError: msg`, chained-exception separators); marker = `dropped N stack frames` + `content_key`. Beats blind truncation on frame integrity: truncate cuts at a line boundary and can split a `File "..."` header from its code line, and a multi-line trailing message can push the crucial error line out of the tail window — the frame-aware strategy never splits a frame and always keeps the message lines. A frame header is detected byte-level (strip leading `0x20`/`0x09`, then `File "` or `at ` + `(`) — the `(` requirement rejects prose like "at the store". Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, TRUNCATE)` — just before TRUNCATE, so every existing fixture is claimed by an earlier strategy first (zero regression by construction; a pure stack trace has no `INFO/DEBUG` noise so log never claims it). Determinism via in-order frame segmentation + index math (no hash-order dependence), Py/Rs byte-identical. New `10_stacktrace.json` fixture (30-frame recursion trace): 2906→**1386** bytes through the full pipeline, cross-language byte-for-byte |
 | M17 | `b6fa1a0` | sixth content-aware strategy: **CSV/table compression** | keep the header row + first 3 + last 2 data rows, collapse the middle homogeneous rows into a single marker (`dropped N table rows` + `content_key`). Beats blind truncation on semantics: truncate doesn't know "the header is the signal" — once data rows are numerous enough to push the column names out of the `HEAD_LINES` window the names are lost and the remaining number rows are unreadable; the CSV strategy pins the header to line 0. Detection is conservative/strong-signal: after dropping a single trailing newline, **every** non-empty line must contain the same delimiter (`,` preferred, then `\t`) the same number of times (≥1) — prose can't have an identical comma count on every line; an interior blank line or a quoted-comma (which breaks the equal-count invariant) falls through to truncate. Delimiter counting is pure ASCII byte counting (`,`=0x2C/`\t`=0x09 are never UTF-8 continuation bytes) ⇒ identical to Python `str.count`. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, CSV, TRUNCATE)` — just before the catch-all, so every existing fixture is claimed earlier (zero regression: all 10 prior fixtures keep their exact byte counts). New `11_csv.json` fixture (60-row table): 3533→**1095** bytes through the full pipeline, cross-language byte-for-byte |
 | M18 | `10e3522b` | seventh content-aware strategy: **Markdown table compression** | keep the header row + the **separator row** (`\|---\|---\|`) + first 3 + last 2 data rows, collapse the middle homogeneous rows into a single marker (`dropped N markdown table rows` + `content_key`). Distinct from CSV (M17), not just a different delimiter: a markdown table has an extra **separator row** that must be pinned — it defines column alignment and is a required part of a valid GFM table, and blind truncation would push both the header and separator out of the window. Detection is conservative/strong-signal: after dropping a single trailing newline, **every** line must contain the same number (≥1) of `\|`, **and** the second line must be a valid separator (only `\|`, `:`, `-`, space, with at least one `-`). The separator row is the key discriminator from CSV/prose — CSV data has no pipes, prose has neither an identical pipe count nor a separator row. Pipe/separator counting is pure ASCII byte counting (`\|`=0x7C/`-`=0x2D/`:`=0x3A are never UTF-8 continuation bytes) ⇒ identical to Python `str.count`. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, TRUNCATE)` — markdown before csv (more specific; the two are mutually exclusive, pipe vs comma), so a genuine markdown table is never grabbed by csv; the existing csv fixture has no pipes so markdown doesn't claim it (zero regression: all 10 prior fixtures keep their exact byte counts). New `12_markdown.json` fixture (40-row table): 3121→**1262** bytes through the full pipeline, cross-language byte-for-byte |
+| M19 | `7fe44e8b` | eighth content-aware strategy (first **character-range**): **base64/hex blob compression** | the first intra-line strategy — the prior seven all drop whole lines or array elements; this one slices head/tail *within a line* by character offset. Finds the longest contiguous run of blob characters (base64/base64url/hex set, **no newlines or spaces** ⇒ a single token, targeting single-line data URIs), keeps the first 64 + last 64 characters, splices a marker (`dropped N blob chars` + `content_key`) into the middle, copies the rest of the text verbatim. **Parity key:** character-range slicing diverges between Python (code points) and Rust (bytes), so the strategy **requires the whole text to be ASCII** (`isascii`/`is_ascii`) — under ASCII, code point == byte, so both languages slice at identical offsets; non-ASCII is never claimed (falls through to truncate), and blobs are ASCII anyway. Detection is conservative/strong-signal: the contiguous run must be ≥512 chars — prose can't hold 512 chars with no spaces, and minified code/URLs are broken by `.;,?&{}()`. Limitation (honest): single-line blobs only (the run doesn't cross newlines); MIME/PEM line-wrapped base64 is a future extension. Registered `(JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, BLOB, TRUNCATE)` — last before the catch-all (very specific), so a single-line blob (no newlines) is claimed by no multi-line strategy and blob catches what would otherwise fall to truncate yet can't be compressed as one line (zero regression: all 12 prior fixtures keep their exact byte counts). New `13_blob.json` fixture (2600-char data URI): 2950→**948** bytes through the full pipeline, cross-language byte-for-byte |
 
 ## Field Notes / 實測筆記 (2026-06-12)
 
@@ -352,16 +353,56 @@ STACKTRACE, MARKDOWN, CSV, TRUNCATE)`——markdown 排 csv 前（更專一的�
 不認領——零回歸（既有 10 fixture 位元數全不變）。新增的 `12_markdown.json` fixture——
 40 列表格——走完整 pipeline 壓 3121→1262 bytes、兩語言逐字節一致。
 
+## Notes — M19 (2026-06-29)
+
+M19 added the **eighth content-aware strategy** and the **first character-range** one:
+base64/hex blob compression. Every prior strategy drops whole lines or array elements;
+this one slices head and tail *within a single line* by character offset. It finds the
+longest contiguous run of blob characters (the base64/base64url/hex set, with **no
+newlines or spaces** — a single token, which targets single-line data URIs), keeps the
+first 64 + last 64 characters, and splices a marker (`dropped N blob chars` +
+`content_key`) into the middle, copying the rest of the text verbatim. The parity key:
+character-range slicing diverges between Python (code points) and Rust (bytes), so the
+strategy **requires the whole text to be ASCII** — under ASCII a code point equals a
+byte, so both languages slice at identical offsets; non-ASCII content is never claimed
+and falls through to truncate, and real blobs are ASCII anyway. Detection is
+deliberately conservative: the contiguous run must be ≥512 characters — prose can't hold
+512 characters with no spaces, and minified code or URLs are broken up by `.;,?&{}()`.
+Honest limitation: single-line blobs only (the run doesn't cross newlines); MIME/PEM
+line-wrapped base64 is a future extension. It registers `(JSON, DIFF, SEARCH, LOG,
+STACKTRACE, MARKDOWN, CSV, BLOB, TRUNCATE)` — last before the catch-all, very specific,
+so a single-line blob (no newlines) is claimed by none of the multi-line strategies and
+blob catches what would otherwise fall to truncate but can't be compressed as a single
+line — zero regression (all 12 prior fixtures keep their exact byte counts). The new
+`13_blob.json` fixture — a 2600-char data URI — compresses 2950→948 bytes through the
+full pipeline, byte-for-byte across both languages.
+
+## Notes — M19（2026-06-29）
+
+M19 接上**第八片內容感知策略**，也是**第一片「字元範圍」**策略：base64/hex blob 壓縮。
+前七片全是丟整行或 array 元素；這片在**一行之內**按字元偏移切頭尾。它找最長的「連續 blob
+字元串」（base64/base64url/hex 字元集、**不含換行/空白**＝單一 token，鎖定單行 data URI），
+保前 64 + 後 64 字元，中段塞一個 marker（`dropped N blob chars` + `content_key`）、串外
+bytes 照抄。parity 正解：字元範圍切片在 Python（依 code point）與 Rust（依 byte）天生分岔，
+所以本策略**要求整段 text 為純 ASCII**——ASCII 下 code point 與 byte 一對一，兩語言切片偏移
+完全一致；非 ASCII 一律不認領、落 truncate 兜底，而真實 blob 本就純 ASCII。嗅探刻意保守：
+連續串須 ≥512 字元——散文不可能 512 字元不含空白，minified 程式碼/URL 也會被 `.;,?&{}()`
+打斷。誠實的限制：只認單行 blob（run 不跨換行）；MIME/PEM 換行折疊的 base64 留作未來擴充。
+註冊 `(JSON, DIFF, SEARCH, LOG, STACKTRACE, MARKDOWN, CSV, BLOB, TRUNCATE)`——排在 catch-all
+前、極專一，單行 blob（無換行）不被任何多行策略認領，blob 接住「否則落 truncate 卻因單行
+無法壓」的巨型 blob——零回歸（既有 12 fixture 位元數全不變）。新增的 `13_blob.json`
+fixture——2600 字元 data URI——走完整 pipeline 壓 2950→948 bytes、兩語言逐字節一致。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 130 tests
+cd rewrite && uv run pytest -q              # 141 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 132 tests
+cd rewrite/rust-lite && cargo test          # 142 tests
 
-# Cross-language parity gate / 跨語言 parity gate（12 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate（13 fixtures, byte-for-byte）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
