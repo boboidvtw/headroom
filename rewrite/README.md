@@ -435,6 +435,70 @@ find/slice、Rust 用 **byte index**，各自原生索引定位同一邏輯位�
 回歸（既有 13 fixture 位元數全不變）。新增的 `14_html.json` fixture——帶 inline
 script+style+註解、且 body 為中文的爬取頁面——走完整 pipeline 壓 5760→1244 bytes、兩語言逐字節一致。
 
+## Notes — M21 (2026-08-09)
+
+M21 is the first milestone that came out of **reading the answer key rather than building
+forward** (see `READING-02-log-compressor.md`), and it fixes a defect rather than adding a
+strategy. The M12 log strategy classified lines by an ASCII-uppercase severity vocabulary
+(`ERROR`/`WARN`/`INFO`…) — the genre of an *application runtime log*. Build and test runners
+speak a different genre: pytest says `FAILED`, cargo says `error[E0382]`, jest uses glyphs.
+None of them match, so `classified == 0`, `drop == 0`, `applies()` returned false, and the
+input fell through to blind head/tail truncation. Measured on an 85-line pytest run: 85 → 31
+lines with the entire `FAILURES` section removed — precisely the mid-log-error loss that
+M12's own design note claims the strategy prevents. The fix deliberately does **not** extend
+the token table, because that is an open set (finish pytest and cargo is next). It adds a
+*structural* signal instead: a progress line is a long run of status glyphs, a shape that is
+independent of any tool's wording. Two conditions must both hold — a run of ≥ 8 glyphs from
+`.sxXFEP`, **and** the line either ends in `%]` or consists only of glyphs and whitespace.
+The second condition is not optional: a table-of-contents dot leader (`Chapter 3 .......... 42`)
+can be a dozen dots long, so run length alone misfires; the tests cover both sides of that
+boundary. The change lands in `_severity()`, not `_log_applies()` — fixing `applies` alone
+would make the strategy claim the input and then compress nothing, since `squeeze` returns
+the text unchanged when it finds no droppable lines. One parity landmine surfaced during
+implementation: Rust's `str::trim()` strips Unicode whitespace (including U+3000) while
+Python's `bytes.strip()` strips only ASCII `b" \t\n\r\x0b\x0c"`, so the Rust side strips
+bytes explicitly (note `\x0b` is absent from `is_ascii_whitespace()`) and a test locks it.
+The new tests add a class of assertion the suite never had — **"the input it should claim,
+it does claim"**; every prior log test fed input already guaranteed to carry tokens and then
+checked behaviour, which is exactly how this defect stayed green for two months. New fixture
+`15_pytest.json` covers the new path (the 14 existing fixtures passing only proved the old
+paths were intact): 5831 → 1980 bytes, 77 lines → 27, 50 progress lines dropped, both
+`AssertionError`s, both file:line references and the summary all preserved, byte-for-byte
+across both languages. Gates: Python 154 → 162, Rust 154 → 158, parity 14 → 15 all pass,
+clippy 0. Every pre-existing fixture keeps its exact byte count.
+
+**Known limitation:** this covers pytest-style progress output. cargo and jest emit neither
+severity tokens nor glyph runs, so they still fall through to truncation. The real answer is
+the industrial version's step 1 — format detection per genre — not more heuristics here.
+
+## Notes — M21（2026-08-09）
+
+M21 是第一個**從讀解答本而非往前建**得出的里程碑（見 `READING-02-log-compressor.md`），
+而且它修的是缺陷、不是加策略。M12 的 log 策略用 ASCII 大寫 severity 詞彙表
+（`ERROR`/`WARN`/`INFO`…）分類，那是「應用程式 runtime log」的體裁；建置與測試工具講的是
+另一種話：pytest 說 `FAILED`、cargo 說 `error[E0382]`、jest 用符號 —— 一個都不命中，於是
+`classified == 0`、`drop == 0`、`applies()` 回 false，輸入落到盲目頭尾截斷。實測 85 行
+pytest 輸出：85 → 31 行，`FAILURES` 整段消失 —— 正是 M12 自己的設計註解宣稱這支策略要
+避免的「中段 error 被丟掉」。修法刻意**不**擴充 token 表，因為那是開放集合（補完 pytest
+還有 cargo、jest、make，而「另一種工具碰巧不長這樣」永遠有下一個）。改用**結構**訊號：
+進度行是一長串狀態符號，這個形狀與工具的用詞無關。兩個條件須同時成立 —— 存在長度 ≥ 8 的
+`.sxXFEP` 連續段，**且**該行以 `%]` 收尾或整行只有進度符號與空白。第二條不可省：目錄的
+點狀填充（`Chapter 3 .......... 42`）可以有十幾個點，只看連續長度會誤判，測試涵蓋這條
+邊界的兩側。修補點在 `_severity()` 而非 `_log_applies()` —— 只改 applies 會讓策略認領卻
+壓不掉任何東西（squeeze 找不到可丟行就原文回），已實測確認。實作中抓到一個 parity 地雷：
+Rust 的 `str::trim()` 剝 Unicode 空白（含 U+3000），Python 的 `bytes.strip()` 只剝 ASCII
+`b" \t\n\r\x0b\x0c"`，同一行輸入兩語言會分岔；Rust 端改為自行逐字節剝（注意 `\x0b` 不在
+`is_ascii_whitespace()` 裡），並加測試鎖住。新測試補的是這套測試從來沒有的一類斷言 ——
+**「它該認領的輸入，它有認領」**；既有 log 測試全都先餵保證含 token 的輸入再驗行為正確，
+這正是本缺陷能綠燈潛伏兩個月的原因。新增 fixture `15_pytest.json` 覆蓋新路徑（既有 14 個
+fixture 全過只證明舊路徑沒壞）：5831 → 1980 bytes、77 行壓成 27 行、丟掉 50 行進度行，
+兩處 `AssertionError`、兩處檔名行號與 summary 全部存活，兩語言逐字節一致。閘門：
+Python 154 → 162、Rust 154 → 158、parity 14 → 15 全過、clippy 0。既有 fixture 位元數全不變。
+
+**已知限制**：本次只覆蓋 pytest 形狀的進度輸出。cargo 與 jest 既無 severity token 也無
+符號連續段，仍會落到截斷。真正的解是工業版 pipeline 的第 1 步 —— 依體裁做格式偵測 ——
+而不是在這裡繼續堆啟發式。
+
 ## Run / 執行
 
 ```bash
