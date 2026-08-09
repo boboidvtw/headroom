@@ -499,6 +499,71 @@ Python 154 → 162、Rust 154 → 158、parity 14 → 15 全過、clippy 0。既
 符號連續段，仍會落到截斷。真正的解是工業版 pipeline 的第 1 步 —— 依體裁做格式偵測 ——
 而不是在這裡繼續堆啟發式。
 
+## Notes — M22 (2026-08-09)
+
+M22 is the rebuild's **first strategy that selects by information rather than by position**,
+and like M21 it came out of reading the answer key (`READING-03-smart-crusher.md`). Every
+strategy up to this point asked "where does this line/record sit in the input"; the M15 JSON
+strategy keeps `JSON_HEAD = 5` leading and `JSON_TAIL = 2` trailing elements of the largest
+array. Measured on 100 API health-check records — 97 `ok`, 3 `timeout` buried at indices
+48–50 — that compressed 6828 → 550 bytes (92% saved) and **dropped all three timeouts**,
+leaving seven identical `status: ok` rows from which a model would conclude the system is
+healthy. This is more dangerous than the M21 defect precisely because the output looks
+entirely reasonable and the compression ratio looks like a win: the metric is green and the
+conclusion is wrong. The criterion is lifted from `smart_crusher`'s `detect_rare_status_values`
+— specifically the version **after its bug #3 fix**, because the original guard
+`if not (2 <= len(unique_values) <= 10): continue` switched rare-error preservation off
+exactly when error-code cardinality was high, i.e. when it mattered most. The Pareto form:
+distinct values in [2, 50]; sort value frequencies descending; find the smallest K whose
+top-K covers ≥ 80% of items; if K ≤ 5, the remaining values are rare and the elements
+carrying them join the must-keep set. Three distributions are tested, including the one that
+must **not** fire: low-cardinality-with-a-dominant-value fires, bimodal (60 `info` + 25 `warn`
++ 15 distinct rare errors) fires — the case the pre-fix algorithm missed entirely — and a
+uniform distribution never reaches 80% with K ≤ 5 and is correctly identified as
+non-categorical. The keep cap is derived from the same criterion: Pareto already bounds a
+single field's rare set at 20%, but the union across several categorical fields can exceed
+that, so the union gets the same 20% bound. An absolute cap of 10 was written first and was
+wrong — with exactly 15 rare values it silently discarded 5 of the most informative elements,
+the very thing this strategy exists to prevent; the bimodal test caught it. Output format:
+one marker per contiguous dropped run, so an input with no rare values produces a single run
+and is byte-identical to pre-M22 (all 15 existing fixtures keep their exact byte counts,
+`09_json` still 2959 → 1651). Parity: the 80% threshold is integer arithmetic
+(`cum * 100 >= total * 80`) to avoid float divergence, and `BTreeMap` plus explicit sorting
+(frequency descending, value ascending on ties) keeps iteration order identical across
+languages; key/value pair extraction reuses the existing bracket-and-string scan rather than
+parsing JSON. New fixture `16_rare_records.json`: 9275 → 1987 bytes, keeping ids
+`[0,1,2,3,4, 48,49,50, 98,99]`. Compression drops from 92% to 79% and the answer goes from
+wrong to right — the trade this milestone deliberately makes. Gates: Python 162 → 169,
+Rust 158 → 164, parity 15 → 16 all pass, clippy 0.
+
+## Notes — M22（2026-08-09）
+
+M22 是重建**第一個按資訊而非按位置選擇**的策略，和 M21 一樣出自讀解答本
+（`READING-03-smart-crusher.md`）。在此之前每一支策略問的都是「這一行/這一筆排在
+第幾個」；M15 的 JSON 策略保留最大 array 的頭 `JSON_HEAD = 5`、尾 `JSON_TAIL = 2`。
+實測 100 筆 API 健檢結果 —— 97 筆 `ok`、3 筆 `timeout` 埋在第 48–50 —— 壓
+6828 → 550 bytes（省 92%）而**三筆 timeout 全滅**，留下七筆一模一樣的 `status: ok`，
+模型會據此判定系統一切正常。這比 M21 的缺陷更危險，正因為輸出看起來完全合理、
+壓縮率還很漂亮：**指標亮綠燈，結論是錯的**。判準取自 `smart_crusher` 的
+`detect_rare_status_values`，而且刻意用它**修好 bug #3 之後**的版本 —— 原本的
+`if not (2 <= len(unique_values) <= 10): continue` 會讓「保留罕見錯誤」在錯誤種類
+一多時自己關掉，也就是最需要它的時候。Pareto 形式：相異值數落在 [2, 50]；值頻率
+降冪排序；找最小的 K 使 top-K 覆蓋 ≥ 80% 的項目；若 K ≤ 5，其餘的值即罕見，帶有
+它們的元素進必留集合。三種分布都測，包含**不該觸發**的那一種：低基數加主宰值會
+觸發；雙峰（60 `info` + 25 `warn` + 15 種罕見錯誤）會觸發 —— 這正是修補前的演算法
+整個漏掉的情況；均勻分布則永遠無法在 K ≤ 5 內達到 80%，被正確判定為非類別欄。
+保留上限與判準同源：Pareto 已保證單一欄位的罕見集合 ≤ 20%，但多個類別欄的聯集
+可能超過，所以對聯集再套一次 20%。第一版寫的絕對值上限 10 是錯的 —— 罕見值剛好
+15 個時它會安靜丟掉 5 個最有資訊量的元素，正是這支策略要防的事，由 bimodal 測試
+抓出來。輸出格式：每段連續丟棄各插一個 marker，因此無罕見元素的輸入只有一段、
+與 M22 前逐字相同（既有 15 個 fixture 位元數全不變，`09_json` 仍 2959 → 1651）。
+parity：80% 門檻用整數運算（`cum * 100 >= total * 80`）避免浮點分岔，`BTreeMap`
+加顯式排序（頻率降冪、同頻值升冪）讓兩語言迭代順序一致；鍵值對抽取沿用既有的
+括號/字串掃描，不解析 JSON。新增 fixture `16_rare_records.json`：9275 → 1987 bytes，
+保留 id `[0,1,2,3,4, 48,49,50, 98,99]`。壓縮率從 92% 降到 79%，而答案從錯的變成
+對的 —— 這是本里程碑刻意付出的代價。閘門：Python 162 → 169、Rust 158 → 164、
+parity 15 → 16 全過、clippy 0。
+
 ## Run / 執行
 
 ```bash
