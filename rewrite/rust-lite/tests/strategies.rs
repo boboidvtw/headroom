@@ -1004,3 +1004,60 @@ fn html_registered_before_blob_after_csv() {
     let t = names.iter().position(|&n| n == "truncate").unwrap();
     assert!(c < h && h < b && b < t, "順序須為 csv < html < blob < truncate");
 }
+
+// ── M21 — 建置/測試輸出的進度行 ──
+//
+// 補上一整類過去沒有的斷言：「它該認領的輸入，它有認領」。既有 log 測試全都先餵
+// 保證含 ERROR/DEBUG token 的輸入再驗行為，於是「對 pytest 輸出整個不啟動」
+// 這種失效可以長期綠燈潛伏。缺陷實錄見 rewrite/READING-02-log-compressor.md。
+
+fn pytest_output() -> String {
+    let mut v: Vec<String> =
+        vec!["============================= test session starts ==============================".into()];
+    for i in 1..20 {
+        v.push(format!("tests/test_mod{i}.py {}    [{:3}%]", ".".repeat(40), i * 2));
+    }
+    v.push("=================================== FAILURES ===================================".into());
+    v.push(">       assert a == b".into());
+    v.push("E       AssertionError: assert 'a1b2' == 'c3d4'".into());
+    v.push("tests/test_cache.py:42: AssertionError".into());
+    for i in 1..20 {
+        v.push(format!("tests/test_late{i}.py {}   [100%]", ".".repeat(40)));
+    }
+    v.push("========================= 1 failed, 153 passed in 0.31s ========================".into());
+    v.join("\n")
+}
+
+#[test]
+fn log_applies_on_pytest_output() {
+    // 缺陷本體：修補前這裡是 false，輸入落到盲目頭尾截斷。
+    assert!((LOG.applies)(&pytest_output()));
+}
+
+#[test]
+fn pytest_failures_survive_squeeze() {
+    // 真正的契約：FAILURES 在中段，盲目頭尾截斷會整段吃掉它。
+    let out = squeeze_text(&pytest_output()).expect("pytest 輸出應被壓縮");
+    assert!(out.contains("FAILURES"), "FAILURES 區塊必須存活");
+    assert!(out.contains("AssertionError"));
+    assert!(out.contains("tests/test_cache.py:42"));
+    assert!(out.contains("dropped"), "須走 log 策略而非 truncate");
+}
+
+#[test]
+fn long_dot_leader_is_not_a_progress_line() {
+    // 參數空間另一側：目錄點狀填充可以很長，光看連續長度會誤判。
+    let toc = std::iter::repeat_n("Chapter 3 .......................... 42", 20)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(LOG.applies)(&toc));
+}
+
+#[test]
+fn progress_line_strip_is_ascii_only_like_python() {
+    // parity 地雷：Python bytes.strip() 只剝 ASCII 空白，str::trim() 會剝 U+3000。
+    // 全形空格結尾的裸進度行 → 兩語言都必須判為「非進度行」。
+    let line = format!("{}\u{3000}", ".".repeat(20));
+    let text = std::iter::repeat_n(line.as_str(), 20).collect::<Vec<_>>().join("\n");
+    assert!(!(LOG.applies)(&text), "U+3000 收尾不得被剝掉而誤判為進度行");
+}

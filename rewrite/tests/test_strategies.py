@@ -1002,3 +1002,79 @@ def test_html_registered_before_blob_after_csv():
     names = [s.name for s in STRATEGIES]
     assert names.index("csv") < names.index("html") < names.index("blob")
     assert names.index("blob") < names.index("truncate")
+
+
+# ── M21 — 建置/測試輸出的進度行（補上 M12 漏掉的體裁）──
+#
+# 這批測試補的是一整類過去沒有的斷言：**「它該認領的輸入，它有認領」**。
+# 既有 log 測試全都先餵一份保證含 ERROR/DEBUG token 的輸入，再驗行為正確 ——
+# 於是「策略對 pytest 輸出整個不啟動」這種失效可以長期綠燈潛伏。
+# 缺陷實錄與解答本對照見 READING-02-log-compressor.md。
+
+
+def _pytest_output(n_progress: int = 40) -> str:
+    """真實 pytest 輸出的形狀：頭尾大量進度行，中段一個 FAILURES 區塊。"""
+    head = ["============================= test session starts =============================="]
+    head += [f"tests/test_mod{i}.py {'.' * 40}    [{i * 2:3d}%]" for i in range(1, n_progress // 2)]
+    mid = [
+        "=================================== FAILURES ===================================",
+        "_______________________ test_cache_key_is_deterministic ________________________",
+        ">       assert a == b",
+        "E       AssertionError: assert 'a1b2' == 'c3d4'",
+        "tests/test_cache.py:42: AssertionError",
+    ]
+    tail = [f"tests/test_late{i}.py {'.' * 40}   [100%]" for i in range(1, n_progress // 2)]
+    tail += ["========================= 1 failed, 153 passed in 0.31s ========================"]
+    return "\n".join(head + mid + tail)
+
+
+def test_progress_line_classified_as_drop():
+    # 進度行是建置輸出的噪音，結構上可辨識（一長串進度符號），與 severity token 無關。
+    assert _severity("tests/test_mod3.py ........................    [ 15%]") == "drop"
+
+
+def test_short_dot_run_is_not_a_progress_line():
+    # 該過的還要過：散文裡的刪節號不得被當成進度行。
+    assert _severity("見前註 ... 詳如後述") == "other"
+    assert _severity("Chapter 3 ....... 42") == "other"
+
+
+def test_long_dot_leader_is_not_a_progress_line():
+    # 參數空間的另一側：目錄的點狀填充可以很長，光看「連續長度」會誤判。
+    # 判準必須另外要求 `%]` 收尾或整行只有進度符號 —— 這行兩者皆非。
+    assert _severity("Chapter 3 .......................... 42") == "other"
+
+
+def test_bare_glyph_run_is_a_progress_line():
+    # 無路徑前綴、無百分比的裸進度行（pytest 換行續印時會出現）。
+    assert _severity("........................") == "drop"
+
+
+def test_log_applies_on_pytest_output():
+    # 缺陷本體：修補前這裡是 False，輸入落到盲目頭尾截斷。
+    assert LOG.applies(_pytest_output()) is True
+
+
+def test_pytest_failures_survive_squeeze():
+    # 真正的契約（不是「策略行為正確」而是「該保住的有保住」）：
+    # FAILURES 區塊在中段，盲目頭尾截斷會整段吃掉它。
+    out = squeeze_text(_pytest_output())
+    assert "FAILURES" in out
+    assert "AssertionError" in out
+    assert "tests/test_cache.py:42" in out
+
+
+def test_pytest_progress_lines_actually_dropped():
+    # 認領還不夠，得真的壓到東西 —— 只改 applies 會讓 squeeze 原文原樣回。
+    src = _pytest_output()
+    out = squeeze_text(src)
+    assert len(out.split("\n")) < len(src.split("\n"))
+    assert "dropped" in out  # 走 log 策略，不是 truncate 的 "squeezed"
+
+
+def test_progress_lines_do_not_steal_other_strategies():
+    # 不回歸：新增的進度行規則不得讓 log 去吃別的體裁。
+    assert LOG.applies(_diff()) is False
+    assert LOG.applies(_search()) is False
+    assert LOG.applies(_csv_table(40)) is False
+    assert LOG.applies(_md_table(40)) is False

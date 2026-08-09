@@ -117,11 +117,57 @@ def _contains_word(line: bytes, token: bytes) -> bool:
         start = i + 1
 
 
+# ── M21 — 建置/測試輸出的進度行 ──
+#
+# 為何需要這條：severity token 表（ERROR/WARN/INFO…）是為「應用程式 runtime log」
+# 設計的體裁，而 pytest 說 FAILED、cargo 說 `error[E0382]`、jest 用符號 —— 一個都不命中。
+# 結果是 log 策略對建置/測試輸出整個不認領，落到盲目頭尾截斷，把中段的 FAILURES
+# 區塊丟掉；正是 M12 的註解宣稱這支策略要避免的事（缺陷實錄見 READING-02）。
+#
+# 修法刻意**不**擴充 token 表：那是開放集合，補完 pytest 還有 cargo、jest、make，
+# 而「另一種工具碰巧不長這樣」永遠有下一個。改用結構訊號 —— 進度行是一長串狀態符號，
+# 這個形狀與工具的用詞無關。
+#
+# 判準要兩個條件同時成立，因為光看「連續長度」會誤判目錄的點狀填充
+# （`Chapter 3 .......... 42` 可以有十幾個點）：
+#   1. 存在一段長度 >= MIN_PROGRESS_RUN 的進度符號連續段，且
+#   2. 該行以 `%]` 收尾（pytest 的百分比欄），或整行只由進度符號與空白組成。
+#
+# 全程 ASCII byte 視角，與 Rust 端逐字節對齊。
+
+MIN_PROGRESS_RUN = 8  # 連續進度符號的長度下限；低於此視為散文的刪節號
+_PROGRESS_GLYPHS = b".sxXFEP"  # pytest：pass/skip/xfail/xpass/fail/error/其他狀態
+
+
+def _is_progress_line(line: str) -> bool:
+    """結構性判斷：這行是不是建置/測試輸出的進度行。"""
+    lb = line.encode("utf-8")
+    run = best = 0
+    for b in lb:
+        if b in _PROGRESS_GLYPHS:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    if best < MIN_PROGRESS_RUN:
+        return False
+    stripped = lb.strip()
+    if stripped.endswith(b"%]"):
+        return True
+    # 整行只有進度符號與空白 —— 無路徑前綴、無百分比的裸進度行。
+    return all(b in _PROGRESS_GLYPHS or b in b" \t" for b in stripped)
+
+
 def _severity(line: str) -> str:
-    """分類一行：'keep'（高嚴重度，保留）/ 'drop'（噪音，可丟）/ 'other'（無 token，保留）。"""
+    """分類一行：'keep'（高嚴重度，保留）/ 'drop'（噪音，可丟）/ 'other'（無 token，保留）。
+
+    順序：keep token 優先（嚴重度勝過形狀）→ 進度行 → drop token → other。
+    """
     lb = line.encode("utf-8")
     if any(_contains_word(lb, t) for t in _KEEP_TOKENS):
         return "keep"
+    if _is_progress_line(line):
+        return "drop"
     if any(_contains_word(lb, t) for t in _DROP_TOKENS):
         return "drop"
     return "other"

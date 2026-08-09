@@ -117,10 +117,71 @@ enum Sev {
     Other,
 }
 
+// ── M21 — 建置/測試輸出的進度行 ──
+//
+// severity token 表是為「應用程式 runtime log」設計的體裁；pytest 說 FAILED、
+// cargo 說 `error[E0382]`、jest 用符號 —— 一個都不命中，於是 log 策略對建置/測試
+// 輸出整個不認領、落到盲目頭尾截斷，把中段的 FAILURES 丟掉。缺陷實錄見 READING-02。
+//
+// 刻意不擴充 token 表（開放集合，補完 pytest 還有下一個），改用結構訊號。
+// 兩個條件同時成立才算，因為光看連續長度會誤判目錄的點狀填充：
+//   1. 存在長度 >= MIN_PROGRESS_RUN 的進度符號連續段，且
+//   2. 該行以 `%]` 收尾，或整行只由進度符號與空白組成。
+//
+// 與 Python `_is_progress_line` 逐字節對齊（純 ASCII byte 視角）。
+
+const MIN_PROGRESS_RUN: usize = 8;
+const PROGRESS_GLYPHS: &[u8] = b".sxXFEP";
+
+fn is_progress_line(line: &str) -> bool {
+    let lb = line.as_bytes();
+    let (mut run, mut best) = (0usize, 0usize);
+    for b in lb {
+        if PROGRESS_GLYPHS.contains(b) {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    if best < MIN_PROGRESS_RUN {
+        return false;
+    }
+    // 刻意不用 str::trim()：它剝的是 Unicode 空白（含 U+3000 全形空格），而 Python 的
+    // bytes.strip() 只剝 ASCII 的 b" \t\n\r\x0b\x0c"。差一個字元就會讓同一行輸入
+    // 在兩語言分岔 —— parity 是逐字節的，這裡必須自己剝。
+    // 注意 \x0b 不在 Rust 的 is_ascii_whitespace() 裡，得明列。
+    const ASCII_STRIP: &[u8] = b" \t\n\r\x0b\x0c";
+    let mut s = lb;
+    while let Some((f, rest)) = s.split_first() {
+        if ASCII_STRIP.contains(f) {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((l, rest)) = s.split_last() {
+        if ASCII_STRIP.contains(l) {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    if s.ends_with(b"%]") {
+        return true;
+    }
+    s.iter()
+        .all(|b| PROGRESS_GLYPHS.contains(b) || *b == b' ' || *b == b'\t')
+}
+
+/// 順序：keep token 優先（嚴重度勝過形狀）→ 進度行 → drop token → other。
 fn severity(line: &str) -> Sev {
     let lb = line.as_bytes();
     if KEEP_TOKENS.iter().any(|t| contains_word(lb, t)) {
         return Sev::Keep;
+    }
+    if is_progress_line(line) {
+        return Sev::Drop;
     }
     if DROP_TOKENS.iter().any(|t| contains_word(lb, t)) {
         return Sev::Drop;
