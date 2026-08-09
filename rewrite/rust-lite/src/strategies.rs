@@ -17,7 +17,7 @@
 //! 標記格式必須與 Python 版逐字相同 —— 跨語言 parity 的前提。
 
 use crate::ccr::content_key;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const HEAD_LINES: usize = 20;
 pub const TAIL_LINES: usize = 10;
@@ -502,7 +502,108 @@ fn scan_arrays(text: &str) -> Vec<ArraySpan> {
     arrays
 }
 
-/// 純函式：找元素最多的 array 截斷成頭+marker+尾。壓不動回 `None`。
+// ── M22 — 罕見即資訊（第一個「按資訊選擇」的判準）──
+//
+// 頭 5 尾 2 的依據是「排在第幾個」。100 筆健檢裡 3 筆 timeout 埋在中段 → 壓縮率 92%
+// 而三筆全滅、留下七筆一樣的 ok，模型會得出「一切正常」。輸出看起來完全合理、指標
+// 還很漂亮，這正是它比 M21 那個缺陷更危險的地方（見 READING-03）。
+//
+// 判準取自 smart_crusher 的 detect_rare_status_values，且用的是它**修好 Bug #3 之後**
+// 的版本：原版 `if not (2 <= len(unique_values) <= 10): continue` 會讓「保留罕見錯誤」
+// 在錯誤種類一多時自己關掉 —— 而那正是最需要它的時候。改用 Pareto 檢查。
+//
+// parity：80% 門檻用整數運算避免浮點分岔；BTreeMap/顯式排序，絕不依賴雜湊順序。
+
+const RARE_MAX_CARDINALITY: usize = 50;
+const RARE_COVERAGE_PCT: usize = 80;
+const RARE_MAX_K: usize = 5;
+// 上限與判準同源：Pareto 已保證單一欄位的罕見值 <= 20%，但多個類別欄的聯集可能超過，
+// 所以對聯集再套一次 20%。刻意不用絕對值上限 —— 那會在罕見值剛好 15 個時安靜丟掉 5 個
+// 最有資訊量的元素，正是這個策略要避免的事。
+const RARE_MAX_KEEP_PCT: usize = 20;
+
+/// 從一個元素的原文抽出所有 `"key": "value"` 字串對（value 非字串者略過）。
+/// 刻意不解析 JSON —— 全程只做括號/字串掃描，與 Python `_json_string_pairs` 逐字節對齊。
+fn json_string_pairs(elem: &str) -> Vec<(&str, &str)> {
+    let b = elem.as_bytes();
+    let n = b.len();
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    let mut pending: Option<&str> = None;
+    let mut i = 0usize;
+    while i < n {
+        if b[i] == b'"' {
+            let mut j = i + 1;
+            let mut esc = false;
+            while j < n {
+                if esc {
+                    esc = false;
+                } else if b[j] == b'\\' {
+                    esc = true;
+                } else if b[j] == b'"' {
+                    break;
+                }
+                j += 1;
+            }
+            let lit = &elem[i + 1..j.min(n)];
+            i = j + 1;
+            let mut k = i;
+            while k < n && (b[k] == b' ' || b[k] == b'\t' || b[k] == b'\n' || b[k] == b'\r') {
+                k += 1;
+            }
+            if k < n && b[k] == b':' {
+                pending = Some(lit);
+                i = k + 1;
+            } else if let Some(key) = pending.take() {
+                pairs.push((key, lit));
+            }
+            continue;
+        }
+        if matches!(b[i], b',' | b'{' | b'}' | b'[' | b']') {
+            pending = None;
+        }
+        i += 1;
+    }
+    pairs
+}
+
+/// 帶有罕見類別值的元素索引（升冪、已去重）。
+fn rare_value_indices(elem_texts: &[&str]) -> Vec<usize> {
+    // BTreeMap 保證鍵有序 → 兩語言迭代順序一致
+    let mut by_key: BTreeMap<&str, BTreeMap<&str, Vec<usize>>> = BTreeMap::new();
+    for (idx, t) in elem_texts.iter().enumerate() {
+        for (key, val) in json_string_pairs(t) {
+            by_key.entry(key).or_default().entry(val).or_default().push(idx);
+        }
+    }
+    let mut rare: BTreeSet<usize> = BTreeSet::new();
+    for (_key, values) in by_key {
+        if values.len() < 2 || values.len() > RARE_MAX_CARDINALITY {
+            continue;
+        }
+        let total: usize = values.values().map(|v| v.len()).sum();
+        // 頻率降冪；同頻以值字串升冪 → 與 Python sorted(key=(-len, value)) 一致
+        let mut ordered: Vec<(&str, &Vec<usize>)> = values.iter().map(|(k, v)| (*k, v)).collect();
+        ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+        let mut cum = 0usize;
+        let mut k_needed = 0usize;
+        for (rank, (_, idxs)) in ordered.iter().enumerate() {
+            cum += idxs.len();
+            if cum * 100 >= total * RARE_COVERAGE_PCT {
+                k_needed = rank + 1;
+                break;
+            }
+        }
+        if k_needed == 0 || k_needed > RARE_MAX_K {
+            continue;
+        }
+        for (_, idxs) in &ordered[k_needed..] {
+            rare.extend(idxs.iter().copied());
+        }
+    }
+    rare.into_iter().collect()
+}
+
+/// 純函式：找元素最多的 array，保留頭+尾+罕見值元素，其餘丟棄。壓不動回 `None`。
 fn json_squeeze_core(text: &str) -> Option<String> {
     if !starts_json(text) {
         return None;
@@ -517,21 +618,48 @@ fn json_squeeze_core(text: &str) -> Option<String> {
     }
     let best = best?;
     let (start, end, elems) = (best.0, best.1, &best.2);
-    if elems.len() < JSON_HEAD + JSON_TAIL + MIN_JSON_DROP {
+    let total = elems.len();
+    let elem_texts: Vec<&str> = elems.iter().map(|&(s, e)| &text[s..e]).collect();
+
+    let mut keep: BTreeSet<usize> = BTreeSet::new();
+    for i in 0..JSON_HEAD.min(total) {
+        keep.insert(i);
+    }
+    for i in total.saturating_sub(JSON_TAIL)..total {
+        keep.insert(i);
+    }
+    // 罕見元素只從「原本會被丟掉」的那些裡挑；聯集上限為總數的 RARE_MAX_KEEP_PCT %
+    let rare_cap = total * RARE_MAX_KEEP_PCT / 100;
+    let rare: Vec<usize> = rare_value_indices(&elem_texts)
+        .into_iter()
+        .filter(|i| !keep.contains(i))
+        .take(rare_cap)
+        .collect();
+    keep.extend(rare);
+
+    if total.saturating_sub(keep.len()) < MIN_JSON_DROP {
         return None;
     }
-    let dropped = elems.len() - JSON_HEAD - JSON_TAIL;
-    let marker = format!(
-        "\"[... headroom-lite dropped {dropped} array elements | sha256:{} ...]\"",
-        content_key(text)
-    );
-    let mut parts: Vec<&str> = Vec::with_capacity(JSON_HEAD + JSON_TAIL + 1);
-    for &(s, e) in &elems[..JSON_HEAD] {
-        parts.push(&text[s..e]);
-    }
-    parts.push(&marker);
-    for &(s, e) in &elems[elems.len() - JSON_TAIL..] {
-        parts.push(&text[s..e]);
+
+    let digest = content_key(text);
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < total {
+        if keep.contains(&i) {
+            parts.push(elem_texts[i].to_string());
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < total && !keep.contains(&j) {
+            j += 1;
+        }
+        // 每段連續丟棄各插一個 marker；無罕見元素時只有一段 → 與 M22 前逐字相同
+        parts.push(format!(
+            "\"[... headroom-lite dropped {} array elements | sha256:{digest} ...]\"",
+            j - i
+        ));
+        i = j;
     }
     let new_array = format!("[{}]", parts.join(","));
     Some(format!("{}{}{}", &text[..start], new_array, &text[end..]))

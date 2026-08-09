@@ -440,8 +440,107 @@ def _scan_arrays(text: str) -> list[tuple[int, int, list[tuple[int, int]]]]:
     return arrays
 
 
+# ── M22 — 罕見即資訊（第一個「按資訊選擇」的判準）──
+#
+# 頭 5 尾 2 的選擇依據是「排在第幾個」。100 筆健檢結果裡 3 筆 timeout 埋在中段，
+# 壓縮率 92% 而三筆全滅、留下七筆一樣的 ok —— 模型會得出「一切正常」。輸出看起來
+# 完全合理、指標還很漂亮，這正是它比 M21 那個缺陷更危險的地方（見 READING-03）。
+#
+# 判準取自 smart_crusher 的 detect_rare_status_values，且用的是它**修好 Bug #3 之後**
+# 的版本：原版 `if not (2 <= len(unique_values) <= 10): continue` 會讓「保留罕見錯誤」
+# 在錯誤種類一多時自己關掉 —— 而那正是最需要它的時候。改用 Pareto 檢查：
+#
+#   1. 相異值數在 [2, RARE_MAX_CARDINALITY] 之內（超過幾乎確定是 ID 或自由文字欄）
+#   2. 值頻率降冪排序，找最小的 K 使 top-K 覆蓋 >= 80% 的項目
+#   3. 若 K <= RARE_MAX_K，其餘的值即「罕見」，含有它們的元素進必留集合
+#
+# 三種分布都要對，包含**不該觸發**的那一種：低基數+主宰值（95 ok + 5 錯誤）→ 觸發；
+# 雙峰（60 info + 25 warn + 15 種罕見錯誤）→ 觸發，這是舊版整個漏掉的；
+# 均勻分布（每個值各出現一兩次）→ K 永遠達不到 80%，正確判定為非類別欄、不觸發。
+#
+# parity：80% 門檻用整數運算（cum * 100 >= total * 80）避免浮點分岔；鍵與同頻值都
+# 顯式排序，絕不依賴 dict 迭代順序。
+
+RARE_MAX_CARDINALITY = 50  # 相異值數上限；超過視為 ID/自由文字欄，非狀態列舉
+RARE_COVERAGE_PCT = 80  # top-K 需覆蓋的項目佔比（整數百分比，避免浮點）
+RARE_MAX_K = 5  # 覆蓋門檻所需的 K 上限；超過代表分布太平、不是類別欄
+# 罕見保留的上限與判準同源：Pareto 已保證「單一欄位」的罕見值 <= 20%，但多個類別欄
+# 各自標記的集合聯集起來可能超過，所以對聯集再套一次同樣的 20%。刻意不用絕對值上限
+# （原本寫 10）—— 那會在罕見值剛好 15 個時安靜地丟掉 5 個最有資訊量的元素，
+# 正是這個策略要避免的事。
+RARE_MAX_KEEP_PCT = 20
+
+
+def _json_string_pairs(elem: str) -> list[tuple[str, str]]:
+    """從一個元素的原文抽出所有 `"key": "value"` 字串對（value 非字串者略過）。
+
+    刻意不解析 JSON —— 本策略全程只做括號/字串掃描（承襲 _scan_arrays）。
+    遇到 `,{}[]` 就把待配的 key 丟掉：那代表 value 是數字/bool/null/巢狀，不是字串。
+    """
+    pairs: list[tuple[str, str]] = []
+    pending: str | None = None
+    i, n = 0, len(elem)
+    while i < n:
+        c = elem[i]
+        if c == '"':
+            j, esc = i + 1, False
+            while j < n:
+                d = elem[j]
+                if esc:
+                    esc = False
+                elif d == "\\":
+                    esc = True
+                elif d == '"':
+                    break
+                j += 1
+            lit = elem[i + 1 : j]
+            i = j + 1
+            k = i
+            while k < n and elem[k] in " \t\n\r":
+                k += 1
+            if k < n and elem[k] == ":":
+                pending = lit
+                i = k + 1
+            elif pending is not None:
+                pairs.append((pending, lit))
+                pending = None
+            continue
+        if c in ",{}[]":
+            pending = None
+        i += 1
+    return pairs
+
+
+def _rare_value_indices(elem_texts: list[str]) -> list[int]:
+    """回傳「帶有罕見類別值」的元素索引（升冪、已去重）。"""
+    by_key: dict[str, dict[str, list[int]]] = {}
+    for idx, t in enumerate(elem_texts):
+        for key, val in _json_string_pairs(t):
+            by_key.setdefault(key, {}).setdefault(val, []).append(idx)
+
+    rare: set[int] = set()
+    for key in sorted(by_key):  # 確定性：鍵排序，不依賴 dict 迭代順序
+        values = by_key[key]
+        if not (2 <= len(values) <= RARE_MAX_CARDINALITY):
+            continue
+        total = sum(len(v) for v in values.values())
+        # 頻率降冪；同頻以值字串升冪 → 兩語言排序結果一致
+        ordered = sorted(values.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        cum = k_needed = 0
+        for rank, (_, idxs) in enumerate(ordered, 1):
+            cum += len(idxs)
+            if cum * 100 >= total * RARE_COVERAGE_PCT:
+                k_needed = rank
+                break
+        if k_needed == 0 or k_needed > RARE_MAX_K:
+            continue
+        for _, idxs in ordered[k_needed:]:
+            rare.update(idxs)
+    return sorted(rare)
+
+
 def _json_squeeze_core(text: str) -> str | None:
-    """純函式：找元素最多的 array 截斷成頭+marker+尾。壓不動回 None。"""
+    """純函式：找元素最多的 array，保留頭+尾+罕見值元素，其餘丟棄。壓不動回 None。"""
     if not _starts_json(text):
         return None
     arrays = _scan_arrays(text)
@@ -453,15 +552,34 @@ def _json_squeeze_core(text: str) -> str | None:
     if best is None:
         return None
     start, end, elems = best
-    dropped = len(elems) - JSON_HEAD - JSON_TAIL
+    elem_texts = [text[s:e] for s, e in elems]
+    total = len(elems)
+
+    keep = set(range(min(JSON_HEAD, total))) | set(range(max(0, total - JSON_TAIL), total))
+    # 罕見元素只從「原本會被丟掉」的那些裡挑；聯集上限為總數的 RARE_MAX_KEEP_PCT %
+    rare_cap = total * RARE_MAX_KEEP_PCT // 100
+    for idx in [i for i in _rare_value_indices(elem_texts) if i not in keep][:rare_cap]:
+        keep.add(idx)
+
+    dropped = total - len(keep)
     if dropped < MIN_JSON_DROP:
         return None
-    head = [text[s:e] for s, e in elems[:JSON_HEAD]]
-    tail = [text[s:e] for s, e in elems[-JSON_TAIL:]]
+
     digest = content_key(text)
-    marker = f'"[... headroom-lite dropped {dropped} array elements | sha256:{digest} ...]"'
-    new_array = "[" + ",".join([*head, marker, *tail]) + "]"
-    return text[:start] + new_array + text[end:]
+    parts: list[str] = []
+    i = 0
+    while i < total:
+        if i in keep:
+            parts.append(elem_texts[i])
+            i += 1
+            continue
+        j = i
+        while j < total and j not in keep:
+            j += 1
+        # 每一段連續丟棄各插一個 marker；無罕見元素時只有一段 → 與 M22 前逐字相同
+        parts.append(f'"[... headroom-lite dropped {j - i} array elements | sha256:{digest} ...]"')
+        i = j
+    return text[:start] + "[" + ",".join(parts) + "]" + text[end:]
 
 
 def _json_applies(text: str) -> bool:

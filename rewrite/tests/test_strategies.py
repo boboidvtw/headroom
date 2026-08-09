@@ -1078,3 +1078,75 @@ def test_progress_lines_do_not_steal_other_strategies():
     assert LOG.applies(_search()) is False
     assert LOG.applies(_csv_table(40)) is False
     assert LOG.applies(_md_table(40)) is False
+
+
+# ── M22 — 罕見即資訊（JSON 策略第一個「按資訊選擇」的判準）──
+#
+# 動機見 READING-03：既有 JSON 策略保留頭 5 尾 2，選擇依據是「排在第幾個」。
+# 100 筆健檢結果裡 3 筆 timeout 埋在中段 → 壓縮率 92% 而三筆全滅，
+# 留下七筆一樣的 ok，模型會得出「一切正常」。判準改自 smart_crusher 的
+# Pareto 檢查（並且是它修好 Bug #3 之後的版本，不是 `2 <= n <= 10` 那個）。
+
+
+def _records(n=100, rare_at=(48, 49, 50)) -> str:
+    rows = []
+    for i in range(n):
+        if i in rare_at:
+            rows.append({"id": i, "endpoint": f"/api/v1/res{i}", "status": "timeout",
+                         "error": "upstream did not respond"})
+        else:
+            rows.append({"id": i, "endpoint": f"/api/v1/res{i}", "status": "ok"})
+    return _json.dumps({"results": rows})
+
+
+def test_json_keeps_rare_status_elements():
+    # 缺陷本體：修補前三筆 timeout 全被丟掉。
+    out = squeeze_text(_records())
+    assert out.count('"status": "timeout"') == 3
+    assert "upstream did not respond" in out
+
+
+def test_json_rare_skips_uniform_field():
+    # 該過的還要過：每筆 name 都不同 → 非類別欄，不得觸發（09_json fixture 就是這形狀）。
+    rows = [{"id": i, "name": f"row_{i}"} for i in range(24)]
+    text = _json.dumps({"data": rows})
+    out = squeeze_text(text)
+    assert out.count("headroom-lite dropped") == 1  # 單一連續丟棄段 → 一個 marker
+    assert "row_10" not in out  # 中段照丟，行為與 M22 前相同
+
+
+def test_json_rare_skips_high_cardinality_id_field():
+    # 基數超過上限 → 幾乎確定是 ID 欄不是狀態列舉，不得觸發。
+    rows = [{"i": i, "uuid": f"id-{i:04d}"} for i in range(60)]
+    out = squeeze_text(_json.dumps({"data": rows}))
+    assert out.count("headroom-lite dropped") == 1
+
+
+def test_json_rare_bimodal_case():
+    # smart_crusher 的 Bug #3 舊版整個漏掉的情況：60 info + 25 warn + 15 種罕見錯誤，
+    # top-2 覆蓋 85% → 其餘 15 個值為罕見。
+    # 罕見值刻意擺「中段」：擺尾端的話 tail 視窗會順手撈到，測試會因為錯的理由而通過。
+    rows = [{"i": i, "lvl": "info"} for i in range(60)]
+    rows += [{"i": 200 + i, "lvl": f"err_{i}"} for i in range(15)]
+    rows += [{"i": 100 + i, "lvl": "warn"} for i in range(25)]
+    out = squeeze_text(_json.dumps({"data": rows}))
+    assert out.count("err_") == 15, "雙峰分布下的 15 個罕見錯誤全部必須被保留"
+
+
+def test_json_rare_keeps_source_order_and_marks_each_run():
+    # 中段有必留元素 → 丟棄段被切成兩段 → 兩個 marker，且元素維持源序。
+    out = squeeze_text(_records())
+    assert out.count("headroom-lite dropped") == 2
+    assert out.index('"id": 48') < out.index('"id": 98')
+
+
+def test_json_rare_deterministic():
+    text = _records()
+    assert squeeze_text(text) == squeeze_text(text)
+
+
+def test_json_rare_still_stores_original_once():
+    store = _SpyStore()
+    text = _records()
+    squeeze_text(text, store=store)
+    assert store.puts == [text]

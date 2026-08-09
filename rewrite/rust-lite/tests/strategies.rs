@@ -1061,3 +1061,75 @@ fn progress_line_strip_is_ascii_only_like_python() {
     let text = std::iter::repeat_n(line.as_str(), 20).collect::<Vec<_>>().join("\n");
     assert!(!(LOG.applies)(&text), "U+3000 收尾不得被剝掉而誤判為進度行");
 }
+
+// ── M22 — 罕見即資訊（對齊 Python test_strategies.py）──
+//
+// 動機見 READING-03：頭 5 尾 2 的依據是「排在第幾個」，3 筆 timeout 埋在中段就全滅，
+// 而壓縮率 92% 讓它看起來像成功。判準取自 smart_crusher 修好 Bug #3 之後的 Pareto 檢查。
+
+fn records(n: usize, rare_at: &[usize]) -> String {
+    let mut rows: Vec<String> = Vec::new();
+    for i in 0..n {
+        if rare_at.contains(&i) {
+            rows.push(format!(
+                r#"{{"id": {i}, "endpoint": "/api/v1/res{i}", "status": "timeout", "error": "upstream did not respond"}}"#
+            ));
+        } else {
+            rows.push(format!(
+                r#"{{"id": {i}, "endpoint": "/api/v1/res{i}", "status": "ok"}}"#
+            ));
+        }
+    }
+    format!(r#"{{"results": [{}]}}"#, rows.join(", "))
+}
+
+#[test]
+fn json_keeps_rare_status_elements() {
+    let out = squeeze_text(&records(100, &[48, 49, 50])).expect("該壓");
+    assert_eq!(out.matches(r#""status": "timeout""#).count(), 3, "三筆罕見值全部必須保留");
+    assert!(out.contains("upstream did not respond"));
+}
+
+#[test]
+fn json_rare_skips_uniform_field() {
+    // 該過的還要過：每筆 name 都不同 → 非類別欄，不得觸發（09_json fixture 的形狀）。
+    let rows: Vec<String> = (0..24)
+        .map(|i| format!(r#"{{"id": {i}, "name": "row_{i}"}}"#))
+        .collect();
+    let text = format!(r#"{{"data": [{}]}}"#, rows.join(", "));
+    let out = squeeze_text(&text).expect("該壓");
+    assert_eq!(out.matches("headroom-lite dropped").count(), 1, "單一連續丟棄段 → 一個 marker");
+}
+
+#[test]
+fn json_rare_skips_high_cardinality_id_field() {
+    let rows: Vec<String> = (0..60)
+        .map(|i| format!(r#"{{"i": {i}, "uuid": "id-{i:04}"}}"#))
+        .collect();
+    let text = format!(r#"{{"data": [{}]}}"#, rows.join(", "));
+    let out = squeeze_text(&text).expect("該壓");
+    assert_eq!(out.matches("headroom-lite dropped").count(), 1);
+}
+
+#[test]
+fn json_rare_bimodal_case() {
+    // Bug #3 舊版整個漏掉的情況；罕見值刻意擺中段，擺尾端會被 tail 順手撈到而假通過。
+    let mut rows: Vec<String> = (0..60).map(|i| format!(r#"{{"i": {i}, "lvl": "info"}}"#)).collect();
+    rows.extend((0..15).map(|i| format!(r#"{{"i": {}, "lvl": "err_{i}"}}"#, 200 + i)));
+    rows.extend((0..25).map(|i| format!(r#"{{"i": {}, "lvl": "warn"}}"#, 100 + i)));
+    let text = format!(r#"{{"data": [{}]}}"#, rows.join(", "));
+    let out = squeeze_text(&text).expect("該壓");
+    assert_eq!(out.matches("err_").count(), 15, "雙峰分布下 15 個罕見錯誤全部必須保留");
+}
+
+#[test]
+fn json_rare_marks_each_dropped_run() {
+    let out = squeeze_text(&records(100, &[48, 49, 50])).expect("該壓");
+    assert_eq!(out.matches("headroom-lite dropped").count(), 2, "中段有必留元素 → 兩段丟棄");
+}
+
+#[test]
+fn json_rare_deterministic() {
+    let text = records(100, &[48, 49, 50]);
+    assert_eq!(squeeze_text(&text), squeeze_text(&text));
+}
