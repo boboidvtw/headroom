@@ -564,16 +564,130 @@ parity：80% 門檻用整數運算（`cum * 100 >= total * 80`）避免浮點分
 對的 —— 這是本里程碑刻意付出的代價。閘門：Python 162 → 169、Rust 158 → 164、
 parity 15 → 16 全過、clippy 0。
 
+## Notes — M23 (2026-08-10)
+
+M23 is the rebuild's **first observer**: it never changes a byte. Everything before it —
+including M3 cache stabilization — was a *normalizer*. `READING-05-cache-stabilization.md`
+found that the industrial `cache_stabilization/` splits Phase E into observers
+(`volatile_detector`, `drift_detector`, which never mutate the body) and normalizers
+(behind gates), and that **the rebuild had only the normalizing half**. The division of
+labour is the point: normalization fixes what the proxy can fix, observation surfaces what
+only the customer can fix. A per-request timestamp in the customer's system prompt is not
+the proxy's to delete — but staying silent about it is a choice too, because from the
+outside a miss caused by volatile customer content and a miss caused by the proxy look
+identical. This scans for ISO-8601 timestamps, UUID v4s, and ID-named fields
+(`request_id` / `trace_id` / `session_id` / `correlation_id`), and writes one stderr
+observation line per finding. No regex — every pattern is explicit byte-position checks.
+The UUID rule is the sharp one: it keys on the version nibble at position 14, so it is not
+looking for UUIDs, it is looking for UUIDs *that will change* (a build hash is not v4; a
+fixed identifier would not vary between requests anyway).
+
+**Ported naively, it was wrong on real input.** The answer key's `volatile_detector` walks
+every message; run over the existing fixtures, `01_messy_full` and `06_noisy_log` each
+produced **10 findings that all hit the cap**, every one of them located at `messages[2]` —
+the last message, i.e. the live zone. That content is never in the cached prefix (M3's
+`_place_breakpoints` puts marker 2 on `messages[-2]`), it changes every turn, and changing
+is harmless. Worse than noise: the cap is global and the walk order is system → messages →
+tools, so one timestamp-laden `tool_result` fills all ten slots and **silently crowds out
+real findings in `tools`**. So M23 skips the last message. This mirrors the industrial
+`drift_detector`, which deliberately skips the live-zone tail for the same reason — first
+separate the changes that are expected, or the alarm is just noise. Three tests pin it:
+live-zone content is not reported, `messages[-2]` still is, and a body with a noisy live
+zone plus one `correlation_id` in `tools` must report exactly the `tools` finding.
+
+Three deliberate divergences from the answer key, each documented in-module rather than
+left to look like omissions. (1) The entry point takes **bytes** and parses its own copy;
+the industrial version takes `&Value` to avoid a second parse and gates non-mutation with
+`debug_assert_eq!` plus byte-equality integration tests. Paying one extra parse per POST
+buys an invariant the borrow checker enforces: the scanner never holds the caller's object.
+(2) Sample truncation counts **characters**, not bytes — Python indexes by code point and
+Rust by byte, and a character cap is the only one that yields the same sample string in
+both (still bounded, ≤ 320 bytes). (3) No `ApiKind` split: the rebuild only ever speaks
+Anthropic `/v1/messages`, so a second walker would be a branch with no second caller.
+
+Parity landmines, both of the "the two languages disagree about what a character is" family:
+`str.isdigit()` returns `True` for Arabic-Indic digits while `u8::is_ascii_digit` does not,
+so both sides compare against ASCII `0-9` explicitly; and `str.lower()` is Unicode-aware and
+can change a string's length, so ID-key matching folds only `A-Z` to match Rust's
+`to_ascii_lowercase`. Number literals are read with `parse_float=str, parse_int=str` on the
+Python side to line up with Rust's `arbitrary_precision`, so a `trace_id` of `1.10` yields
+the same sample in both instead of `1.1` — the M15 landmine again. That test initially
+failed for an instructive reason: it built its body through `json.dumps`, which had already
+flattened `1.10` to `1.1` before the scanner ever saw it, so it was verifying an input it
+had broken itself.
+
+Because the scan changes nothing, the byte-for-byte parity gate cannot see it — passing
+phase 1 only proves the old paths still work (the same lesson M21 learned when it added
+`15_pytest.json`). `parity.sh` therefore gained a **second phase** comparing the findings
+themselves across languages over every fixture, plus `17_volatile.json`, which exists
+because most fixtures have no volatile content and an all-empty comparison prints a wall of
+`PASS` while verifying nothing. Its expected finding count is hard-coded in the gate, so
+editing the fixture forces editing the assertion. Gates: Python 169 → 190, Rust 164 → 186,
+parity 16 → 17 fixtures × 2 phases, clippy 0. End-to-end: posting the fixture through the
+running proxy emits four observation lines and forwards bytes unchanged.
+
+## Notes — M23（2026-08-10）
+
+M23 是重建**第一個觀測器**：一個 byte 都不改。在它之前的所有東西 —— 包含 M3 的
+cache 穩定化 —— 都是**正規化器**。`READING-05-cache-stabilization.md` 讀出工業版的
+`cache_stabilization/` 把 Phase E 切成觀測（`volatile_detector`、`drift_detector`，
+絕不動 body）與正規化（會動，但受閘門管）兩類，而**重建只有正規化那一半**。這個
+分工才是重點：正規化修的是 proxy 修得動的，觀測揭露的是只有客戶自己能修的。客戶
+system prompt 裡每次現算的時間戳不是 proxy 該刪的 —— 但沉默也是一種選擇，因為從
+外面看，「因為客戶內容易變而 miss」和「因為 proxy 弄壞而 miss」長得一模一樣。本片
+掃 ISO-8601 時間戳、UUID v4、以及 ID 名稱欄位（`request_id` / `trace_id` /
+`session_id` / `correlation_id`），每筆發現印一行 stderr 觀測線。不用 regex —— 每個
+pattern 都是明寫的位元組位置檢查。UUID 那條判準最漂亮：它認第 14 位的 version
+nibble，所以**它不是在找 UUID，是在找「會變的」UUID**（build hash 不是 v4；固定
+識別碼本來就不會在請求之間變）。
+
+**照抄過來，在真實輸入上是錯的。** 解答本的 `volatile_detector` 走訪全部 messages；
+拿既有 fixture 一跑，`01_messy_full` 與 `06_noisy_log` 各噴 **10 筆、全部撞上限**，
+而且 location 一律是 `messages[2]` —— 最後一則訊息，也就是 live zone。那段內容從來
+不在快取前綴裡（M3 的 `_place_breakpoints` 把標記 2 放在 `messages[-2]`），它每輪都
+變，而且變了無害。比噪音更糟的是：上限是全域的、走訪順序是 system → messages →
+tools，光一則塞滿時間戳的 `tool_result` 就能占滿十個名額，**把 `tools` 裡真正該報的
+東西安靜擠掉**。所以 M23 跳過最後一則。這與工業版 `drift_detector` 刻意跳過
+live-zone 尾端是同一個道理 —— 先分清哪些變化是預期的，否則警報等於雜訊。三條測試
+釘住它：live zone 的內容不得回報、`messages[-2]` 仍要回報、以及「live zone 全是噪音
+＋ `tools` 裡一個 `correlation_id`」必須剛好只回報 `tools` 那一筆。
+
+三處刻意偏離解答本，都寫在模組註解裡，而不是留著看起來像漏做的。(1) 入口吃
+**bytes**、自己 parse 一份副本；工業版收 `&Value` 以省一次 parse，非變性靠呼叫端的
+`debug_assert_eq!` 與逐位元組整合測試守。每個 POST 多付一次 parse，換到的是借用
+檢查器替你強制的不變量：掃描器手上根本沒有呼叫端的物件。(2) sample 截斷數
+**字元**不是 byte —— Python 依 code point、Rust 依 byte 索引，只有字元上限能讓兩邊
+吐出同一串（仍然有界，≤ 320 bytes）。(3) 不做 `ApiKind` 分歧：重建全程只講
+Anthropic `/v1/messages`，第二個 walker 會是一個沒有第二個呼叫者的分支。
+
+parity 地雷兩顆，都屬於「兩個語言對『什麼算一個字元』意見不同」這一家：
+`str.isdigit()` 對阿拉伯-印度數字回 `True` 而 `u8::is_ascii_digit` 不會，所以兩邊都
+明寫比對 ASCII `0-9`；`str.lower()` 是 Unicode 感知的、可能改變字串長度，所以 ID key
+比對只折 `A-Z`，對齊 Rust 的 `to_ascii_lowercase`。數字在 Python 側用
+`parse_float=str, parse_int=str` 讀進來以對齊 Rust 的 `arbitrary_precision`，`trace_id`
+是 `1.10` 時兩邊 sample 一致而非變成 `1.1` —— 又是 M15 那顆雷。那條測試第一次失敗的
+理由很有教育意義：它用 `json.dumps` 組 body，`1.10` 在進掃描器**之前**就已經被壓成
+`1.1`，等於拿一個自己弄壞的輸入去驗。
+
+因為掃描什麼都不改，byte-for-byte 的 parity gate 根本看不見它 —— 相 1 全過只證明
+舊路徑沒壞（M21 補 `15_pytest.json` 時學到的同一課）。所以 `parity.sh` 多了**第二
+相**，對每個 fixture 比對兩語言的 findings 本身，另加 `17_volatile.json`：多數
+fixture 本來就沒有 volatile 內容，全空的比對會印一整排 `PASS` 而什麼都沒驗到。它的
+預期筆數寫死在 gate 裡，改那份 fixture 就必須連帶改斷言。閘門：Python 169 → 190、
+Rust 164 → 186、parity 16 → 17 fixtures × 兩相、clippy 0。端到端：把 fixture POST
+進跑著的 proxy，印出四行觀測線且轉發的 bytes 不變。
+
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 154 tests
+cd rewrite && uv run pytest -q              # 190 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 154 tests
+cd rewrite/rust-lite && cargo test          # 186 tests
 
-# Cross-language parity gate / 跨語言 parity gate（14 fixtures, byte-for-byte）
+# Cross-language parity gate / 跨語言 parity gate
+# 相 1：17 fixtures pipeline bytes；相 2：volatile findings（M23）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
