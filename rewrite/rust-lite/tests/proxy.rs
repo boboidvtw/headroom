@@ -24,6 +24,8 @@ use headroom_lite_rs::proxy::create_app;
 const CANONICAL: &[u8] = include_bytes!("../../tests/fixtures/03_canonical_passthrough.json");
 /// 會被 pipeline 真的動手壓縮的 messy body（parity gate 14473→2524）。
 const MESSY: &[u8] = include_bytes!("../../tests/fixtures/01_messy_full.json");
+/// 快取熱區塞了時間戳 / UUID v4 / correlation_id 的 body（M23 觀測用）。
+const VOLATILE: &[u8] = include_bytes!("../../tests/fixtures/17_volatile.json");
 
 /// 上游實際收到的 (method, uri, headers, body)。
 type CapturedRequest = (String, String, axum::http::HeaderMap, Vec<u8>);
@@ -94,6 +96,29 @@ async fn canonical_body_passes_through_byte_faithful() {
     // 必須與 client 送出的「逐字節」相同 —— cache 北極星。
     let (_, _, _, body) = captured.take();
     assert_eq!(body, CANONICAL);
+}
+
+#[tokio::test]
+async fn volatile_scan_does_not_touch_forwarded_bytes() {
+    // M23：掃描是 observe，不是 normalize。這份 fixture **一定**掃得出東西
+    // （前提先斷言，否則測到的只是「沒有掃描時 bytes 也不會變」——空的比對），
+    // 而上游收到的 bytes 仍必須與 pipeline 的輸出逐字節相同。
+    let findings = headroom_lite_rs::volatile::scan_request(VOLATILE);
+    assert_eq!(findings.len(), 4, "fixture 前提變了：{findings:?}");
+
+    let expected = process_request(VOLATILE, Some(&mut CcrStore::new())).into_owned();
+    let (proxy_url, captured) = spawn_proxy_with_upstream().await;
+
+    reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(VOLATILE)
+        .send()
+        .await
+        .unwrap();
+
+    let (_, _, _, body) = captured.take();
+    assert_eq!(body, expected, "volatile 掃描不得影響轉發的 bytes");
 }
 
 #[tokio::test]

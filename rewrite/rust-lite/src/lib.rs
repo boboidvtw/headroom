@@ -13,6 +13,7 @@ pub mod ccr;
 pub mod pipeline;
 pub mod proxy;
 pub mod strategies;
+pub mod volatile;
 
 pub mod live_zone {
     //! live-zone 壓縮引擎（與 Python 版行為 / 標記格式逐字對齊）。

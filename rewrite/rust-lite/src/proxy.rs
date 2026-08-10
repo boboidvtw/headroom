@@ -111,6 +111,23 @@ fn json_response(status: StatusCode, value: &Value) -> Response {
         .expect("json response is always valid")
 }
 
+/// 把 volatile findings 印成觀測線（stderr）。**一個 byte 都不改請求。**
+///
+/// sample 是客戶內容，可能含換行 / tab / 引號 —— 用 JSON 字串跳脫輸出，
+/// 一筆就是一行，不會被內容打穿而錯亂 log。
+fn emit_volatile_observations(raw: &[u8]) {
+    for finding in crate::volatile::scan_request(raw) {
+        let sample = serde_json::to_string(&finding.sample)
+            .unwrap_or_else(|_| String::from("\"<unprintable>\""));
+        eprintln!(
+            "  [volatile] {} at {} sample={sample} \
+             （在快取前綴裡，每輪都變 → 這段前綴每次都 miss；移到 live zone 或請求 metadata）",
+            finding.kind.as_str(),
+            finding.location,
+        );
+    }
+}
+
 async fn forward(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let Ok(raw) = axum::body::to_bytes(body, usize::MAX).await else {
@@ -118,6 +135,14 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: Request) -> Response
     };
 
     let in_len = raw.len(); // raw 之後會被 move，先記長度供觀測線用
+
+    // M23 volatile 唯讀掃描（observe，不是 normalize）：掃 **client 原始的**
+    // bytes —— 要指出來給使用者修的是他自己寫的內容，不是 pipeline 處理過的。
+    // 掃描器自己 parse 一份副本，改不到 raw；成本是 POST 多一次 JSON parse，
+    // 買到的是「非變性結構上不可能違反」（見 volatile.rs module docs）。
+    if parts.method == Method::POST {
+        emit_volatile_observations(&raw);
+    }
 
     // 只有 POST 過引擎（/v1/messages 形狀的 body 才有 live zone 可壓；
     // 引擎對非目標 body 的契約本來就是 Borrowed 放行）。

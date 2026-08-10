@@ -1,0 +1,27 @@
+{
+  "model": "claude-haiku-4-5",
+  "max_tokens": 1024,
+  "system": [
+    {"type": "text", "text": "You are a build assistant. Current time: 2026-08-10T09:15:00Z."},
+    {"type": "text", "text": "Conversation 3f2b9c10-7d41-4e0a-9b52-c8ad61f0e2d4 started; keep answers short."}
+  ],
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Which jobs failed in the last run?"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "Let me check the pipeline."}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01A", "content": "compile ok\nlink ok\npackage ok\n"}]}
+  ],
+  "tools": [
+    {
+      "name": "lookup_build",
+      "description": "Look up a build record. Search index last rebuilt 2026-08-10T04:00:00Z.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "correlation_id": "ci-2026-08-10-0417",
+          "build": {"type": "string"}
+        },
+        "required": ["build"]
+      }
+    }
+  ]
+}
