@@ -600,31 +600,78 @@ left to look like omissions. (1) The entry point takes **bytes** and parses its 
 the industrial version takes `&Value` to avoid a second parse and gates non-mutation with
 `debug_assert_eq!` plus byte-equality integration tests. Paying one extra parse per POST
 buys an invariant the borrow checker enforces: the scanner never holds the caller's object.
-(2) Sample truncation counts **characters**, not bytes — Python indexes by code point and
-Rust by byte, and a character cap is the only one that yields the same sample string in
-both (still bounded, ≤ 320 bytes). (3) No `ApiKind` split: the rebuild only ever speaks
-Anthropic `/v1/messages`, so a second walker would be a branch with no second caller.
+(2) `sample` never echoes customer values — see the review round below. (3) No `ApiKind`
+split: the rebuild only ever speaks Anthropic `/v1/messages`, so a second walker would be a
+branch with no second caller.
 
-Parity landmines, both of the "the two languages disagree about what a character is" family:
+Parity landmines of the "the two languages disagree about what a character is" family:
 `str.isdigit()` returns `True` for Arabic-Indic digits while `u8::is_ascii_digit` does not,
 so both sides compare against ASCII `0-9` explicitly; and `str.lower()` is Unicode-aware and
 can change a string's length, so ID-key matching folds only `A-Z` to match Rust's
-`to_ascii_lowercase`. Number literals are read with `parse_float=str, parse_int=str` on the
-Python side to line up with Rust's `arbitrary_precision`, so a `trace_id` of `1.10` yields
-the same sample in both instead of `1.1` — the M15 landmine again. That test initially
-failed for an instructive reason: it built its body through `json.dumps`, which had already
-flattened `1.10` to `1.1` before the scanner ever saw it, so it was verifying an input it
-had broken itself.
+`to_ascii_lowercase`.
 
 Because the scan changes nothing, the byte-for-byte parity gate cannot see it — passing
 phase 1 only proves the old paths still work (the same lesson M21 learned when it added
 `15_pytest.json`). `parity.sh` therefore gained a **second phase** comparing the findings
 themselves across languages over every fixture, plus `17_volatile.json`, which exists
 because most fixtures have no volatile content and an all-empty comparison prints a wall of
-`PASS` while verifying nothing. Its expected finding count is hard-coded in the gate, so
-editing the fixture forces editing the assertion. Gates: Python 169 → 190, Rust 164 → 186,
-parity 16 → 17 fixtures × 2 phases, clippy 0. End-to-end: posting the fixture through the
-running proxy emits four observation lines and forwards bytes unchanged.
+`PASS` while verifying nothing.
+
+### The review round: both reviewers blocked, and they were right
+
+`rust-reviewer` and `python-reviewer` were run before pushing. Both returned BLOCK. Every
+disputed claim was reproduced independently before acting on it; all of them held.
+
+**The parity claim in the paragraph above used to be wrong, and this README asserted it.**
+The original text said Python's `parse_float=str, parse_int=str` lined up with Rust's
+`arbitrary_precision` so that a `trace_id` of `1.10` produced the same sample in both. That
+is true only for trailing zeros after a decimal point — the one example that had been
+tested. A differential harness found `1E5` renders as `1e+5` on the Rust side and `-0`
+renders as `0`; `json.dumps` also re-quotes numbers-that-are-strings, so any ID field whose
+value was an object containing a number diverged too. This is the "a formula derived from a
+special case takes the test down with it" shape: the test guarded the read path and nothing
+guarded the write path, and the false generalization was then written into the docs.
+
+**The `sample` policy was rebuilt around never echoing customer content.** The ID-field
+needles are matched as *substrings*, so `session_identity_token` matches `session_id` — and
+that field's value is frequently a credential in its own right. Most API keys are shorter
+than the old 80-character cap, so they were not even truncated. Since the matching set is
+open-ended, the only safe rule is to never emit the value: `id_field` samples are now a type
+descriptor (`string[38]`, `number`, `object[2]`, `array[5]`, `bool`), and `uuid_v4` samples
+are redacted to an 8-character prefix because v4-shaped API keys are common. `location`
+already pinpoints the field, which is all a user needs in order to act. This one change also
+retired the entire number-literal divergence family and made character-vs-byte truncation
+moot, since the longest sample is now 19 characters.
+
+**Contract violations.** `_scan_value` raised `RecursionError` at ~1000 levels of nesting,
+violating the stated "never raises" contract — and `except (ValueError, ...)` could not have
+caught it. Worse, serde_json rejects at 128 nested containers while Python's parser does not,
+so 127–999 was a silent divergence band. Python now mirrors serde_json's limit with an
+*iterative* depth check (using recursion to measure recursion depth is how you blow the stack
+you were trying to protect), pinned on both sides by `depth_126` / `depth_127`. Three more
+input classes needed the same alignment: `NaN`, non-UTF-8 and BOM-prefixed bodies, and lone
+surrogate escapes — Python accepts all three, serde_json rejects all three *for the whole
+document*, so the rejection granularity had to match. Paired surrogates must still work, and
+are tested, because a guard that also blocks what should pass is not a guard. On the Rust
+side, `eprintln!` panics when stderr write fails (`proxy 2>&1 | tee log` with a departed
+reader is EPIPE), on the one path that had just been declared panic-free.
+
+**The cap was crowding out real findings.** `MAX_FINDINGS` counted hits, not locations, so
+three timestamp-bearing frozen messages filled all ten slots across only three distinct
+locations and silently displaced the one `session_id` finding in `tools`. The cap now counts
+distinct `(kind, location)` pairs with a `count` per finding, and `truncated` is an explicit
+signal — exactly-ten and gave-up-at-ten must not look identical. A 1 MiB scan budget bounds
+the work: this runs *before* forwarding, so scan time is latency.
+
+**The gate that would have caught all of it did not exist.** Seventeen fixtures touched none
+of the eleven divergence classes — "the two implementations guard each other" was a claim
+that had never been tested. `parity.sh` gained a **third phase**: 15 adversarial fixtures,
+each with a **golden** expectation rather than a mere cross-language comparison, because
+about half of the correct answers here are "both sides empty" and comparing empty to empty
+passes while verifying nothing. The gate additionally asserts the fixture count and greps
+every output for the planted secret. Gates: Python 169 → 200, Rust 164 → 191, parity 17
+fixtures × 2 phases + 15 adversarial cases, clippy 0. End-to-end: posting the fixture through
+the running proxy emits four observation lines and forwards bytes unchanged.
 
 ## Notes — M23（2026-08-10）
 
@@ -655,39 +702,79 @@ live-zone 尾端是同一個道理 —— 先分清哪些變化是預期的，�
 三處刻意偏離解答本，都寫在模組註解裡，而不是留著看起來像漏做的。(1) 入口吃
 **bytes**、自己 parse 一份副本；工業版收 `&Value` 以省一次 parse，非變性靠呼叫端的
 `debug_assert_eq!` 與逐位元組整合測試守。每個 POST 多付一次 parse，換到的是借用
-檢查器替你強制的不變量：掃描器手上根本沒有呼叫端的物件。(2) sample 截斷數
-**字元**不是 byte —— Python 依 code point、Rust 依 byte 索引，只有字元上限能讓兩邊
-吐出同一串（仍然有界，≤ 320 bytes）。(3) 不做 `ApiKind` 分歧：重建全程只講
-Anthropic `/v1/messages`，第二個 walker 會是一個沒有第二個呼叫者的分支。
+檢查器替你強制的不變量：掃描器手上根本沒有呼叫端的物件。(2) `sample` 永不回吐客戶
+的值 —— 見下面的 review 回合。(3) 不做 `ApiKind` 分歧：重建全程只講 Anthropic
+`/v1/messages`，第二個 walker 會是一個沒有第二個呼叫者的分支。
 
-parity 地雷兩顆，都屬於「兩個語言對『什麼算一個字元』意見不同」這一家：
-`str.isdigit()` 對阿拉伯-印度數字回 `True` 而 `u8::is_ascii_digit` 不會，所以兩邊都
-明寫比對 ASCII `0-9`；`str.lower()` 是 Unicode 感知的、可能改變字串長度，所以 ID key
-比對只折 `A-Z`，對齊 Rust 的 `to_ascii_lowercase`。數字在 Python 側用
-`parse_float=str, parse_int=str` 讀進來以對齊 Rust 的 `arbitrary_precision`，`trace_id`
-是 `1.10` 時兩邊 sample 一致而非變成 `1.1` —— 又是 M15 那顆雷。那條測試第一次失敗的
-理由很有教育意義：它用 `json.dumps` 組 body，`1.10` 在進掃描器**之前**就已經被壓成
-`1.1`，等於拿一個自己弄壞的輸入去驗。
+parity 地雷屬於「兩個語言對『什麼算一個字元』意見不同」這一家：`str.isdigit()` 對
+阿拉伯-印度數字回 `True` 而 `u8::is_ascii_digit` 不會，所以兩邊都明寫比對 ASCII
+`0-9`；`str.lower()` 是 Unicode 感知的、可能改變字串長度，所以 ID key 比對只折
+`A-Z`，對齊 Rust 的 `to_ascii_lowercase`。
 
 因為掃描什麼都不改，byte-for-byte 的 parity gate 根本看不見它 —— 相 1 全過只證明
 舊路徑沒壞（M21 補 `15_pytest.json` 時學到的同一課）。所以 `parity.sh` 多了**第二
 相**，對每個 fixture 比對兩語言的 findings 本身，另加 `17_volatile.json`：多數
-fixture 本來就沒有 volatile 內容，全空的比對會印一整排 `PASS` 而什麼都沒驗到。它的
-預期筆數寫死在 gate 裡，改那份 fixture 就必須連帶改斷言。閘門：Python 169 → 190、
-Rust 164 → 186、parity 16 → 17 fixtures × 兩相、clippy 0。端到端：把 fixture POST
+fixture 本來就沒有 volatile 內容，全空的比對會印一整排 `PASS` 而什麼都沒驗到。
+
+### review 回合：兩支 reviewer 都擋下，而且他們是對的
+
+push 之前跑了 `rust-reviewer` 與 `python-reviewer`，兩支都回 BLOCK。每一條有爭議的
+指控都先獨立複驗過才動手 —— 結果全部成立。
+
+**上一段的 parity 宣稱原本是錯的，而這份 README 白紙黑字這樣寫過。** 原文說 Python 的
+`parse_float=str, parse_int=str` 對齊了 Rust 的 `arbitrary_precision`，所以 `trace_id`
+是 `1.10` 時兩邊 sample 一致。那句話只在「小數點後的尾隨零」成立 —— 也就是當初唯一
+驗過的那個例子。差分 harness 打出來：`1E5` 在 Rust 會變 `1e+5`、`-0` 會變 `0`；而
+`json.dumps` 還會把「以字串型態存在的數字」重新加上引號，所以任何值是「內含數字的
+物件」的 ID 欄位也一起分岔。這正是「特例推導的公式會連測試一起錯」的形狀：**測試守住
+了讀進來那一半，寫出去那一半沒人守**，而錯誤的推廣還被寫進了文件。
+
+**`sample` 政策整個重做成「絕不回吐客戶內容」。** ID 欄位的 needle 是**子字串**比對，
+`session_identity_token` 命中 `session_id` —— 而這種欄位的值在很多系統裡本身就是憑證。
+多數 API key 比原本 80 字元的上限還短，連截斷都不會發生。既然命中集合是開放的、列舉
+不完，唯一安全的規則就是永遠不輸出值：`id_field` 的 sample 改成型別描述
+（`string[38]` / `number` / `object[2]` / `array[5]` / `bool`），`uuid_v4` 的 sample
+截成 8 字元前綴（v4 形狀的 API key 很常見）。`location` 已經精確到欄位，使用者要動手
+修所需的資訊全在那裡。這一刀同時讓整族數字字面值分岔退場，也讓「字元 vs byte 截斷」
+變得無關緊要 —— 現在最長的 sample 只有 19 個字元。
+
+**契約違反。** `_scan_value` 在約 1000 層巢狀時會拋 `RecursionError`，直接違反白紙
+黑字的「絕不拋例外」—— 而且 `except (ValueError, ...)` 根本接不住。更糟的是 serde_json
+在 128 層容器就拒收而 Python 的 parser 不會，於是 127–999 是一整段無聲分岔帶。Python
+現在用**迭代**的深度檢查鏡射 serde_json 的上限（用遞迴去量遞迴深度，量到一半就爆掉
+你本來要保護的 stack），並由 `depth_126` / `depth_127` 兩側各釘一條。還有三類輸入需要
+同樣的對齊：`NaN`、非 UTF-8 與帶 BOM 的 body、落單的 surrogate 跳脫 —— Python 三類都
+接受，serde_json 三類都拒收**且是整份文件**，所以拒收的粒度也必須一致。成對 surrogate
+必須照常運作，而且有測試 —— 會把該過的一起擋掉的守門不是守門。Rust 那側，`eprintln!`
+在 stderr 寫入失敗時會 panic（`proxy 2>&1 | tee log` 的 reader 先退場就是 EPIPE），
+偏偏就在那條剛剛宣告過「絕不 panic」的路徑上。
+
+**上限把真發現擠掉了。** `MAX_FINDINGS` 算的是命中次數而非位置，於是三則帶時間戳的
+凍結訊息就吃滿十個名額、只覆蓋三個相異位置，並把 `tools` 裡唯一那筆 `session_id`
+安靜擠掉。現在上限算相異的 `(kind, location)`、每筆帶 `count`，而 `truncated` 是明
+訊號 —— 剛好十筆與「撞上限放棄」不能長得一樣。另加 1 MiB 的掃描預算把工作量圈住：
+這條路徑跑在**轉發之前**，掃多久就是延遲多久。
+
+**能抓到這一切的那道 gate 本來不存在。** 17 個 fixture 一個都碰不到那 11 類分岔 ——
+「兩份實作互為守門」是一個從未被檢驗過的宣稱。`parity.sh` 因此多了**第三相**：15 個
+adversarial fixture，而且每個都有 **golden** 而非只比對兩語言是否一致 —— 因為這裡有
+一半的正確答案就是「兩邊都空」，空對空會通過而什麼都沒驗到。這一相另外斷言 fixture
+數量，並對每份輸出 grep 埋進去的祕密。閘門：Python 169 → 200、Rust 164 → 191、
+parity 17 fixtures × 兩相 + 15 個 adversarial 案例、clippy 0。端到端：把 fixture POST
 進跑著的 proxy，印出四行觀測線且轉發的 bytes 不變。
 
 ## Run / 執行
 
 ```bash
 # Python (uv-managed 3.13 venv; fastapi doesn't support 3.14 yet)
-cd rewrite && uv run pytest -q              # 190 tests
+cd rewrite && uv run pytest -q              # 200 tests
 
 # Rust (standalone workspace)
-cd rewrite/rust-lite && cargo test          # 186 tests
+cd rewrite/rust-lite && cargo test          # 191 tests
 
 # Cross-language parity gate / 跨語言 parity gate
-# 相 1：17 fixtures pipeline bytes；相 2：volatile findings（M23）
+# 相 1：17 fixtures pipeline bytes；相 2：volatile findings；
+# 相 3：15 個 adversarial 案例對 golden（M23 review 後補）
 cd rewrite && ./scripts/parity.sh
 
 # Run the Rust proxy / 跑 Rust proxy（M7；預設 127.0.0.1:8787 → api.anthropic.com）
