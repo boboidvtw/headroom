@@ -60,11 +60,14 @@ VOL_BIN="rust-lite/target/debug/examples/volatile_stdin"
 PY_VOLATILE='
 import json, sys
 from headroom_lite.volatile import scan_request
-for f in scan_request(sys.stdin.buffer.read()):
+scan = scan_request(sys.stdin.buffer.read())
+for f in scan.findings:
     print(json.dumps(
-        {"kind": f.kind, "location": f.location, "sample": f.sample},
+        {"kind": f.kind, "location": f.location, "sample": f.sample, "count": f.count},
         ensure_ascii=False, separators=(",", ":"),
     ))
+if scan.truncated:
+    print(json.dumps({"truncated": True}, separators=(",", ":")))
 '
 
 for fixture in "$FIXTURE_DIR"/*.json "$FIXTURE_DIR"/*.bin; do
@@ -98,3 +101,61 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 echo "volatile parity gate: ALL PASS"
+
+# ─── 相 3：adversarial 差分（2026-08-10，M23 review 後補）─────────────────
+#
+# 相 2 只證明「兩邊在這 17 個 fixture 上一致」。code review 用差分 harness
+# 打出 11 類分岔，17 個 fixture 一個都碰不到 —— **「兩份實作互為守門」在被
+# 打過之前只是宣稱**。這一相拿刻意構造的邊界輸入來打，而且不只比對兩邊是否
+# 一致：**每個案例都有 golden**。理由是這裡有一半的正確答案就是「兩邊都空」
+# （NaN / BOM / 超深巢狀），只比「兩邊一致」的話，兩邊一起壞掉會安靜通過。
+echo
+ADV_DIR="$FIXTURE_DIR/volatile"
+# 不得出現在任何輸出裡的祕密（secret_id_field.bin 的值）—— id_field 規則
+# 是唯一會撈任意客戶值的，這條守它永遠不把值印出來。
+SECRET="REDACTEDSECRET"
+
+for fixture in "$ADV_DIR"/*.bin; do
+    [ -e "$fixture" ] || continue
+    name="$(basename "$fixture" .bin)"
+    expected="$ADV_DIR/$name.expected"
+    if [ ! -e "$expected" ]; then
+        echo "FAIL  $name — 缺 golden（.expected）；adversarial fixture 一律要有預期答案"
+        fail=1
+        continue
+    fi
+    uv run python -c "$PY_VOLATILE" < "$fixture" > "$OUT_DIR/adv.$name.py" 2>"$OUT_DIR/adv.$name.pyerr" || {
+        echo "FAIL  $name — Python 側拋例外（契約：壞輸入必須安靜回空）："
+        cat "$OUT_DIR/adv.$name.pyerr"
+        fail=1
+        continue
+    }
+    "$VOL_BIN" < "$fixture" > "$OUT_DIR/adv.$name.rs" || {
+        echo "FAIL  $name — Rust 側非零退出"
+        fail=1
+        continue
+    }
+    ok=1
+    cmp -s "$OUT_DIR/adv.$name.py" "$expected" || { echo "FAIL  $name — Python 與 golden 不符："; diff "$expected" "$OUT_DIR/adv.$name.py" || true; ok=0; }
+    cmp -s "$OUT_DIR/adv.$name.rs" "$expected" || { echo "FAIL  $name — Rust 與 golden 不符："; diff "$expected" "$OUT_DIR/adv.$name.rs" || true; ok=0; }
+    if grep -qF "$SECRET" "$OUT_DIR/adv.$name.py" "$OUT_DIR/adv.$name.rs" 2>/dev/null; then
+        echo "FAIL  $name — 客戶祕密出現在 findings 輸出裡"
+        ok=0
+    fi
+    [ "$ok" -eq 1 ] && echo "PASS  $name" || fail=1
+done
+
+# 非空守門（同相 2 的理由）：這批有一半的 golden 本來就是空的，若 fixture
+# 目錄被清空或 glob 沒配到，上面整個迴圈會一次都不跑而安靜通過。
+adv_count="$(find "$ADV_DIR" -name '*.bin' | wc -l | tr -d ' ')"
+EXPECTED_ADV_CASES=15
+if [ "$adv_count" -ne "$EXPECTED_ADV_CASES" ]; then
+    echo "FAIL  adversarial 案例數為 $adv_count，期望 $EXPECTED_ADV_CASES（新增案例請一併改這個數字）"
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "volatile adversarial gate: FAIL"
+    exit 1
+fi
+echo "volatile adversarial gate: ALL PASS（$adv_count 案例）"

@@ -13,6 +13,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -113,17 +114,38 @@ fn json_response(status: StatusCode, value: &Value) -> Response {
 
 /// 把 volatile findings 印成觀測線（stderr）。**一個 byte 都不改請求。**
 ///
-/// sample 是客戶內容，可能含換行 / tab / 引號 —— 用 JSON 字串跳脫輸出，
-/// 一筆就是一行，不會被內容打穿而錯亂 log。
+/// 用 `writeln!` 而非 `eprintln!`：後者在 stderr 寫入失敗時會 panic
+/// （std 內部就是 `panic!("failed printing to stderr")`），而
+/// `proxy 2>&1 | tee log` 的 reader 先退場就會 EPIPE。這條路徑跑在每個
+/// POST 上、而且是我自己宣告「絕不 panic」的那一條，不能靠運氣。
+/// 順帶只取一次鎖寫完全部 findings。
+///
+/// location 來自客戶的 key 名，可能含換行 / 引號 —— 用 JSON 字串跳脫輸出，
+/// 一筆就是一行，不會被內容打穿而錯亂 log。sample 依政策永不含客戶的值。
 fn emit_volatile_observations(raw: &[u8]) {
-    for finding in crate::volatile::scan_request(raw) {
-        let sample = serde_json::to_string(&finding.sample)
+    let scan = crate::volatile::scan_request(raw);
+    if scan.findings.is_empty() && !scan.truncated {
+        return;
+    }
+    let stderr = std::io::stderr();
+    let mut out = stderr.lock();
+    for finding in &scan.findings {
+        let location = serde_json::to_string(&finding.location)
             .unwrap_or_else(|_| String::from("\"<unprintable>\""));
-        eprintln!(
-            "  [volatile] {} at {} sample={sample} \
+        let _ = writeln!(
+            out,
+            "  [volatile] {} at {location} sample={} x{} \
              （在快取前綴裡，每輪都變 → 這段前綴每次都 miss；移到 live zone 或請求 metadata）",
             finding.kind.as_str(),
-            finding.location,
+            finding.sample,
+            finding.count,
+        );
+    }
+    if scan.truncated {
+        let _ = writeln!(
+            out,
+            "  [volatile] 還有更多未列出（已達 {} 個相異位置的上限）",
+            crate::volatile::MAX_FINDINGS,
         );
     }
 }

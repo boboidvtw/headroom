@@ -1,0 +1,11 @@
+{"kind":"iso8601_timestamp","location":"messages[0].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[1].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[2].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[3].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[4].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[5].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[6].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[7].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[8].content","sample":"2026-05-04T14:30:00","count":1}
+{"kind":"iso8601_timestamp","location":"messages[9].content","sample":"2026-05-04T14:30:00","count":1}
+{"truncated":true}

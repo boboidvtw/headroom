@@ -15,7 +15,8 @@ import json
 from headroom_lite.volatile import (
     ID_FIELD,
     MAX_FINDINGS,
-    SAMPLE_MAX_CHARS,
+    MAX_NESTING,
+    MAX_SCAN_BYTES,
     TIMESTAMP,
     UUID_V4,
     scan_request,
@@ -47,7 +48,7 @@ def test_non_ascii_digits_are_not_digits():
     """parity 地雷：Python `str.isdigit()` 對阿拉伯-印度數字回 True，
     Rust `u8::is_ascii_digit` 不會 —— 兩邊都必須只認 ASCII `0-9`。"""
     findings = scan_request(_body({"system": "٢٠٢٦-٠٥-٠٤T١٤:٣٠:٠٠"}))
-    assert findings == []
+    assert findings.findings == []
 
 
 # ─── 2. uuid v4 ────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ def test_detects_uuid_v4_in_user_message():
     assert len(findings) == 1
     assert findings[0].kind == UUID_V4
     assert findings[0].location == "messages[0].content"
-    assert findings[0].sample == "550e8400-e29b-41d4-a716-446655440000"
+    assert findings[0].sample == "550e8400…"
 
 
 def test_random_hex_without_v4_nibble_is_not_a_uuid():
@@ -128,7 +129,7 @@ def test_detects_request_id_field_in_nested_schema():
     id_fields = [f for f in findings if f.kind == ID_FIELD]
     assert len(id_fields) == 1
     assert id_fields[0].location == "tools[0].input_schema.properties.request_id"
-    assert id_fields[0].sample == "req-2026-abc-12345"
+    assert id_fields[0].sample == "string[18]"
 
 
 def test_id_field_with_empty_value_does_not_fire():
@@ -143,24 +144,28 @@ def test_id_field_name_match_is_ascii_case_insensitive_substring():
     assert findings[0].location == "tools[0].input_schema.X_Request_ID"
 
 
-def test_numeric_id_value_sample_keeps_original_literal():
-    """parity 地雷：Rust 開 arbitrary_precision 保留 `1.10`，Python 預設
-    `json.loads` 會把它變成 float 再變回 `1.1` —— 掃描器必須用
-    parse_float=str 讀，兩邊 sample 才是同一串。
+def test_numeric_id_value_is_never_rendered_as_a_literal():
+    """數字一律描述成 `number`，不渲染字面值。
 
-    body 刻意手寫 bytes：走 `json.dumps` 的話 `1.10` 在進掃描器之前就已經
-    被壓成 `1.1`，這條測試會拿一個自己弄壞的輸入去驗，然後因為錯的理由通過。
+    這條測試的前身斷言「sample 保留原始字面值 `1.10`」，並宣稱
+    `parse_float=str` 對齊了 Rust 的 `arbitrary_precision`。**那句話是錯的**
+    —— 它只在「小數點後尾隨零」成立，而我只驗了 `1.10` 一個例子就推廣了。
+    review 的差分 harness 打出來：`1E5` 在 Rust 會變 `1e+5`、`-0` 會變 `0`。
+    三種都測，涵蓋參數空間兩側而不是只有當初碰巧驗過的那一點。
     """
-    raw = b'{"tools":[{"input_schema":{"trace_id":1.10}}]}'
-    findings = scan_request(raw)
-    assert [f.sample for f in findings] == ["1.10"]
+    for raw in (
+        b'{"tools":[{"input_schema":{"trace_id":1.10}}]}',
+        b'{"tools":[{"input_schema":{"trace_id":1E5}}]}',
+        b'{"tools":[{"input_schema":{"trace_id":-0}}]}',
+    ):
+        assert [f.sample for f in scan_request(raw)] == ["number"], raw
 
 
 def test_number_literals_never_look_like_timestamp_or_uuid():
     """數字以字面值進來後仍會走過字串掃描；合法 JSON 數字字面值不可能
     長成 ISO-8601（要 T/:）或 UUID（要 4 個 `-` 分佈在 8/13/18/23）。"""
     findings = scan_request(_body({"system": [{"type": "text", "value": 1e10}]}))
-    assert findings == []
+    assert findings.findings == []
 
 
 # ─── 4. 不誤報 / 上限 / 非變性 ────────────────────────────────────────
@@ -188,21 +193,143 @@ def test_stable_content_yields_zero_findings():
             }
         )
     )
-    assert findings == []
+    assert findings.findings == []
 
 
-def test_caps_findings():
+def test_caps_distinct_locations_and_signals_truncation():
     messages = [
         {"role": "user", "content": f"turn {i}: 550e8400-e29b-41d4-a716-446655440000"}
         for i in range(30)
     ]
-    assert len(scan_request(_body({"messages": messages}))) == MAX_FINDINGS
+    scan = scan_request(_body({"messages": messages}))
+    assert len(scan) == MAX_FINDINGS
+    assert scan.truncated, "撞上限與『剛好 10 筆』不能長得一樣"
 
 
-def test_sample_is_truncated_with_ellipsis():
-    long_value = "x" * (SAMPLE_MAX_CHARS + 50)
-    findings = scan_request(_body({"tools": [{"input_schema": {"session_id": long_value}}]}))
-    assert findings[0].sample == "x" * SAMPLE_MAX_CHARS + "…"
+def test_repeated_hits_in_one_location_share_a_slot():
+    """上限算的是**相異位置**不是命中次數。
+
+    初版兩者不分，review 實測：三則含時間戳的凍結歷史就吃滿 10 個名額
+    （只覆蓋 3 個相異位置），把 tools 裡唯一真正該報的欄位完全擠掉 ——
+    噪音之外還會漏報。
+    """
+    noisy = " ".join(f"2026-06-11T10:00:{i:02d}" for i in range(40))
+    scan = scan_request(
+        _body(
+            {
+                "messages": [
+                    {"role": "user", "content": noisy},
+                    {"role": "user", "content": "live zone"},
+                ],
+                "tools": [{"input_schema": {"correlation_id": "ci-1"}}],
+            }
+        )
+    )
+    assert not scan.truncated
+    assert [(f.kind, f.location, f.count) for f in scan] == [
+        (TIMESTAMP, "messages[0].content", 40),
+        (ID_FIELD, "tools[0].input_schema.correlation_id", 1),
+    ]
+
+
+def test_id_field_sample_never_contains_the_value():
+    """sample 政策的核心守門。
+
+    needle 是**子字串**比對，`session_identity_token` 命中 `session_id`
+    —— 而 `session_id` 這種欄位在很多系統裡本身就是憑證。命中集合是開放的，
+    列舉不完，所以唯一安全的作法是永遠不回吐值。
+    """
+    secret = "sk-ant-api03-REDACTEDSECRET-abcdefghij"
+    findings = scan_request(
+        _body({"tools": [{"input_schema": {"session_identity_token": secret}}]})
+    )
+    assert [f.kind for f in findings] == [ID_FIELD]
+    assert findings[0].sample == f"string[{len(secret)}]"
+    assert secret not in findings[0].sample
+
+
+def test_id_field_sample_describes_type_and_size():
+    cases = [
+        ("abc", "string[3]"),
+        (7, "number"),
+        (True, "bool"),
+        ([1, 2, 3], "array[3]"),
+        ({"a": 1, "b": 2}, "object[2]"),
+    ]
+    for value, expected in cases:
+        findings = scan_request(_body({"tools": [{"input_schema": {"trace_id": value}}]}))
+        assert findings[0].sample == expected, value
+
+
+def test_string_length_in_sample_counts_characters_not_bytes():
+    """Python `len(str)` 是 code point，Rust 用 `chars().count()` ——
+    用 byte 會讓非 ASCII 值的描述在兩邊分岔。"""
+    findings = scan_request(_body({"tools": [{"input_schema": {"trace_id": "汉字漢"}}]}))
+    assert findings[0].sample == "string[3]"
+
+
+def test_uuid_sample_is_redacted_to_a_prefix():
+    """v4 形狀的 API key 很常見；定位靠 location 就夠。"""
+    findings = scan_request(
+        _body(
+            {
+                "messages": [
+                    {"role": "user", "content": "550e8400-e29b-41d4-a716-446655440000"},
+                    {"role": "user", "content": "x"},
+                ]
+            }
+        )
+    )
+    assert findings[0].sample == "550e8400…"
+
+
+# ─── 4b. 輸入收斂：與 serde_json 的判準對齊 ──────────────────────────
+
+
+def test_nan_is_rejected_whole_document():
+    """Python 預設接受 NaN，serde_json 一律 Err —— 而且是**整包**失敗，
+    所以拒收的粒度也必須是整份文件，不是那個欄位。"""
+    assert scan_request(b'{"system":"2026-05-04T14:30:00Z","x":NaN}').findings == []
+
+
+def test_non_utf8_and_bom_are_rejected():
+    """`json.loads(bytes)` 會依 BOM / null byte 自動偵測 UTF-16/32，
+    `serde_json::from_slice` 只吃 UTF-8。"""
+    assert scan_request('{"system":"2026-05-04T14:30:00Z"}'.encode("utf-16-le")).findings == []
+    assert scan_request(b'\xef\xbb\xbf{"system":"2026-05-04T14:30:00Z"}').findings == []
+
+
+def test_lone_surrogate_rejected_but_paired_still_works():
+    """守門要同時測「該擋的擋了」與「該過的還會過」—— 成對 surrogate
+    （emoji）是合法 JSON，不可以被一起擋掉。"""
+    assert scan_request(b'{"system":"\\ud800 2026-05-04T14:30:00Z"}').findings == []
+    paired = scan_request(b'{"system":"\\ud83d\\ude00 2026-05-04T14:30:00Z"}')
+    assert [f.kind for f in paired] == [TIMESTAMP]
+
+
+def test_deep_nesting_boundary_matches_serde_json():
+    """serde_json 的 parse 深度上限是 128 層容器。**兩側都釘** ——
+    只釘一側的話另一側漂了不會有人知道。"""
+    def nest(depth: int) -> bytes:
+        return ('{"system":' + "[" * depth + '"2026-05-04T14:30:00Z"' + "]" * depth + "}").encode()
+
+    assert len(scan_request(nest(MAX_NESTING - 1))) == 1
+    assert scan_request(nest(MAX_NESTING)).findings == []
+
+
+def test_deep_nesting_does_not_raise():
+    """初版在這裡拋 RecursionError，直接違反「絕不拋例外」的契約 ——
+    而且 `except (ValueError, ...)` 接不住（RecursionError 不是 ValueError）。"""
+    deep = ('{"system":' + "[" * 5000 + '"2026-05-04T14:30:00Z"' + "]" * 5000 + "}").encode()
+    assert scan_request(deep).findings == []
+
+
+def test_oversized_body_is_skipped_with_signal():
+    """觀測是盡力而為的功能。這條路徑跑在轉發之前，掃多久就是延遲多久。"""
+    huge = b'{"system":"' + b"x" * (MAX_SCAN_BYTES + 1) + b'"}'
+    scan = scan_request(huge)
+    assert scan.findings == []
+    assert scan.truncated, "放棄掃描必須留下訊號，不能與『乾淨的 body』長得一樣"
 
 
 def test_scan_does_not_mutate_input_bytes():
@@ -222,9 +349,9 @@ def test_scan_does_not_mutate_input_bytes():
 
 def test_malformed_input_returns_no_findings():
     """壞輸入原樣放行 —— M0 起一路貫穿的失敗模式契約。"""
-    assert scan_request(b"not json at all") == []
-    assert scan_request(b"[1,2,3]") == []
-    assert scan_request(b"\xff\xfe") == []
+    assert scan_request(b"not json at all").findings == []
+    assert scan_request(b"[1,2,3]").findings == []
+    assert scan_request(b"\xff\xfe").findings == []
 
 
 # ─── 5. live zone 不掃（照抄解答本會踩的坑）──────────────────────────
@@ -256,7 +383,7 @@ def test_live_zone_volatile_content_is_not_reported():
             }
         )
     )
-    assert findings == []
+    assert findings.findings == []
 
 
 def test_frozen_history_is_still_reported():
@@ -306,7 +433,7 @@ def test_single_message_body_scans_nothing():
     findings = scan_request(
         _body({"messages": [{"role": "user", "content": "at 2026-06-11T10:00:00Z"}]})
     )
-    assert findings == []
+    assert findings.findings == []
 
 
 # ─── 6. 路徑（location）正確性 ─────────────────────────────────────────

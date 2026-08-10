@@ -103,8 +103,8 @@ async fn volatile_scan_does_not_touch_forwarded_bytes() {
     // M23：掃描是 observe，不是 normalize。這份 fixture **一定**掃得出東西
     // （前提先斷言，否則測到的只是「沒有掃描時 bytes 也不會變」——空的比對），
     // 而上游收到的 bytes 仍必須與 pipeline 的輸出逐字節相同。
-    let findings = headroom_lite_rs::volatile::scan_request(VOLATILE);
-    assert_eq!(findings.len(), 4, "fixture 前提變了：{findings:?}");
+    let scan = headroom_lite_rs::volatile::scan_request(VOLATILE);
+    assert_eq!(scan.findings.len(), 4, "fixture 前提變了：{scan:?}");
 
     let expected = process_request(VOLATILE, Some(&mut CcrStore::new())).into_owned();
     let (proxy_url, captured) = spawn_proxy_with_upstream().await;

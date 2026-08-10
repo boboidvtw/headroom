@@ -1,0 +1,2 @@
+{"kind":"iso8601_timestamp","location":"messages[0].content","sample":"2026-05-04T14:30:00","count":4}
+{"kind":"id_field","location":"tools[0].input_schema.correlation_id","sample":"string[4]","count":1}

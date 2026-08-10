@@ -21,16 +21,43 @@ client 的 system prompt 裡塞了一個每次現算的時間戳 —— proxy �
   3. ID 名稱的欄位（request_id / trace_id / session_id / correlation_id）
      —— 補前兩條漏掉的：整數 trace ID、自訂 slug 格式。
 
-刻意偏離解答本的三處（各有理由，不是漏做）
-------------------------------------------
+sample 政策：絕不回吐客戶內容（2026-08-10 code review 後改）
+-----------------------------------------------------------
+初版照解答本把命中的值原文放進 sample，最長 80 字元。review 實測打穿：
+needle 是**子字串**比對，`session_identity_token` 命中 `session_id`，於是
+一把 40 字元的 API key 原封不動進了 stderr log —— 而多數 key 根本不到 80
+字元、連截斷都不會發生。`session_id` 這種欄位在很多系統裡**本身就是憑證**。
+
+現在的政策：
+
+  ============  ========================================================
+  kind          sample
+  ============  ========================================================
+  timestamp     命中的 19 字元原樣（時間戳不可能是祕密）
+  uuid_v4       前 8 字元 + `…`（v4 形狀的 API key 很常見）
+  id_field      **只給型別**：`string[42]` / `number` / `object[3]` /
+                `array[5]` / `bool` —— 永遠不含客戶的值
+  ============  ========================================================
+
+使用者要修的資訊在 `location` 裡（它已經精確到欄位），值長什麼樣不影響
+他要做的事；賣掉的風險卻很大。
+
+這一刀同時解掉一整族 parity 分岔：sample 不再渲染任意值，所以
+`json.dumps` 幫數字加引號、`arbitrary_precision` 把 `1E5` 正規化成 `1e+5`、
+`-0` 變 `0`、以及「字元 vs byte 截斷」全部消失。**初版 docstring 宣稱
+`parse_float=str` 對齊 `arbitrary_precision`，那句話是錯的** —— 它只在
+「小數點後尾隨零」成立（我只驗了 `1.10` 一個例子就推廣了），指數形式與
+負零都會分岔。現在數字根本不渲染，問題不存在。
+
+刻意偏離解答本之處（各有理由，不是漏做）
+----------------------------------------
   a. **入口吃 bytes、自己 parse 一份副本**。工業版收 `&Value`（proxy 那層
      已經 parse 過，省一次 JSON 成本），非變性靠呼叫端的 debug_assert 與
      整合測試守。重建反過來：多付一次 parse，換「掃描器手上根本沒有呼叫端
      的物件」—— 非變性從『有測試守著』升級成『結構上不可能違反』。
-  b. **sample 截斷用字元數不是 byte 數**。工業版切 80 bytes 並小心 UTF-8
-     邊界；重建切 80 個字元，因為 Python 依 code point、Rust 依 byte，
-     只有用字元上限兩邊才會吐出同一串 sample（parity 是重建的一等目標，
-     工業版沒有這個約束）。上限仍然有界（<= 320 bytes）。
+  b. **sample 不回吐客戶值**（見上）。工業版會，這是重建**嚴格更保守**的
+     一處。工業版另有「bearer token 離開模組前先雜湊」的機制，重建沒有；
+     不回吐值是達到同一目的的更粗但更完整的作法。
   c. **沒有 ApiKind 分歧**。工業版要同時走 Anthropic 與 OpenAI 兩種 body
      形狀；重建全程只有 `/v1/messages`，多一個 enum 只是憑空的分支。
      —— 承 READING-05 的教訓：把「這裡為什麼不需要」寫下來，和寫守門
@@ -39,15 +66,16 @@ client 的 system prompt 裡塞了一個每次現算的時間戳 —— proxy �
 policy（承襲工業版）
 --------------------
   - **不用 regex**：每個 pattern 都是明寫的位元組位置檢查，意圖看得見。
-  - **findings 上限 10**：客戶貼一份 CSV 進 system prompt 就能產出幾百條
-     警告淹掉 log。前 1–3 條就是他會動手修的那幾條。
-  - **sample 截斷**：撈一小片讓客戶定位得到，但絕不整包記客戶資料。
+  - **上限 10 個相異 (kind, location)**，超過時 `truncated` 為真。上限算
+     的是相異位置不是命中次數 —— 同一段 log 裡的 40 個時間戳只佔一個名額，
+     否則它會把 tools 裡真正該報的東西安靜擠掉（review 實測重現）。
+  - **`truncated` 是明訊號**：剛好 10 筆與「≥10、我們放棄了」不能長得一樣。
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # kind 的字串表示是穩定介面（parity 報告與觀測線都吃它），別隨手改。
 TIMESTAMP = "iso8601_timestamp"
@@ -55,10 +83,26 @@ UUID_V4 = "uuid_v4"
 ID_FIELD = "id_field"
 
 MAX_FINDINGS = 10
-SAMPLE_MAX_CHARS = 80
+
+#: UUID sample 只留前綴，足以定位而不構成可用的憑證。
+UUID_SAMPLE_CHARS = 8
+
+#: 容器巢狀深度上限。**這個數字必須跟 Rust 對齊**：serde_json 的 parser
+#: 在第 128 層容器就回 Err（整份文件 → 空結果），Python 的 json 沒有這個
+#: 限制，於是 127–999 層會變成一整段無聲分岔帶（review 實測）。兩側各由
+#: `depth_126` / `depth_127` 兩個 adversarial fixture 釘住 —— 只釘一側的話
+#: 另一側漂了不會有人知道。
+MAX_NESTING = 127
+
+#: 超過這個大小就整包放棄掃描（`truncated` 為真）。觀測是盡力而為的功能，
+#: 不值得為一份 1 GB 的 body 佔住 proxy 的 worker thread —— 而且這條路徑
+#: 跑在**轉發之前**，掃多久就是延遲多久。
+MAX_SCAN_BYTES = 1 << 20
 
 # 慣例上「每請求唯一」的 JSON key 名。對 key 做 ASCII 小寫後的子字串比對
 # —— `x_request_id`、`meta_session_id` 都認得。
+# 注意這是**開放集合**：`session_identity_token` 也會命中。這正是 sample
+# 不准回吐值的理由 —— 命中集合列舉不完，就不能假設命中的東西不是祕密。
 _ID_FIELD_NEEDLES = ("request_id", "trace_id", "session_id", "correlation_id")
 
 _ISO_LEN = 19  # `YYYY-MM-DDTHH:MM:SS`
@@ -69,45 +113,89 @@ _UUID_LEN = 36
 class VolatileFinding:
     """一筆發現。
 
-    location 是 JSON-pointer 風格的路徑（`system[2].text`、
+    location 是欄位存取路徑（`system[2].text`、
     `tools[0].input_schema.properties.session_id`），讓使用者把警告對回
-    自己 request 裡的確切欄位。sample 是截斷過的節錄。
+    自己 request 裡的確切欄位。count 是同一個 (kind, location) 的命中次數。
+    sample 見模組 docstring 的 sample 政策 —— **永不含 id_field 的值**。
     """
 
     kind: str
     location: str
     sample: str
+    count: int = 1
+
+
+@dataclass(frozen=True)
+class VolatileScan:
+    """掃描結果。
+
+    truncated 為真代表「還有更多，我們放棄了」—— 沒有這個欄位的話，剛好
+    10 筆與撞上限長得一模一樣，而那正是本專案反覆吃虧的形狀（守門在最該
+    生效時安靜失效）。
+    """
+
+    findings: list[VolatileFinding] = field(default_factory=list)
+    truncated: bool = False
+
+    def __iter__(self):
+        return iter(self.findings)
+
+    def __len__(self) -> int:
+        return len(self.findings)
+
+    def __getitem__(self, index):
+        return self.findings[index]
 
 
 # ─── 入口 ──────────────────────────────────────────────────────────────
 
 
-def scan_request(raw: bytes) -> list[VolatileFinding]:
+def scan_request(raw: bytes) -> VolatileScan:
     """掃描 request body bytes。永不修改任何東西、永不拋例外。
 
-    壞輸入（非 JSON / 非 object）回空 list —— 與 M0 起的失敗模式契約一致：
-    看不懂的東西就當作沒事，絕不因為觀測而影響請求。
+    看不懂的輸入一律回空結果 —— 與 M0 起的失敗模式契約一致：絕不因為觀測
+    而影響請求。這裡的「看不懂」刻意與 **Rust 端 serde_json 的判準對齊**，
+    因為兩邊不一致就是無聲分岔（以下每一條都是 review 用差分 harness 打
+    出來、且各有一個 adversarial fixture 釘住的）：
 
-    parse_float / parse_int = str：讓數字以**原始字面值**進來，對齊 Rust 的
-    `arbitrary_precision`。否則 `1.10` 在 Python 會變 `1.1`，兩邊 sample 分岔
-    （M15 JSON 策略踩過同一顆雷）。掃描器不重新序列化，所以這樣讀完全安全。
+      * 非 UTF-8：`json.loads(bytes)` 會依 BOM 與 null byte 模式自動偵測
+        UTF-16/32，`serde_json::from_slice` 只吃 UTF-8 → 先顯式 decode。
+        （UTF-8 BOM 能 decode，但留下的 `\\ufeff` 會讓 json.loads 失敗，
+        與 Rust 一致。）
+      * `NaN` / `Infinity`：Python 預設接受，serde_json 一律 Err。而且
+        Rust 是**整包**失敗，body 裡其他地方的 findings 會一起消失 →
+        `parse_constant` 拒收。
+      * 落單的 surrogate 跳脫（`\\ud800`）：Python 接受並產生無法編碼成
+        UTF-8 的 str，serde_json 要求成對 → 先掃原始文字擋掉。成對的
+        （emoji）必須照常通過。
+      * 容器巢狀 > MAX_NESTING：對齊 serde_json 的 parse 深度上限。
     """
+    if len(raw) > MAX_SCAN_BYTES:
+        return VolatileScan([], True)
     try:
-        body = json.loads(raw, parse_float=str, parse_int=str)
-    except (ValueError, UnicodeDecodeError):
-        return []
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return VolatileScan()
+    if _has_lone_surrogate_escape(text):
+        return VolatileScan()
+    try:
+        body = json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        return VolatileScan()
     if not isinstance(body, dict):
-        return []
+        return VolatileScan()
+    if _nesting_depth(body) > MAX_NESTING:
+        return VolatileScan()
     return detect_volatile_content(body)
 
 
-def detect_volatile_content(body: dict) -> list[VolatileFinding]:
+def detect_volatile_content(body: dict) -> VolatileScan:
     """走訪 Anthropic `/v1/messages` 形狀的快取熱區。唯讀。
 
     走訪順序固定（system → messages → tools）且 dict 依插入順序 ——
     Rust 端開了 preserve_order，兩邊撞到上限時砍掉的是同一批。
     """
-    out: list[VolatileFinding] = []
+    out = _Accumulator()
 
     system = body.get("system")
     if system is not None:
@@ -121,22 +209,19 @@ def detect_volatile_content(body: dict) -> list[VolatileFinding]:
         # `messages[-2]`，所以 `messages[-1]` 從來就不在前綴裡 —— 那是
         # live zone，它每輪都變、變了無害，也正是壓縮引擎接著要改寫的東西。
         #
-        # 這不是潔癖。上限是全域的、走訪順序是 system → messages → tools，
-        # 光一則塞滿時間戳的 tool_result 就能灌滿 10 筆，把 tools 裡真正
-        # 該報的東西安靜擠掉 —— 噪音之外還會漏報。
         # （同 drift_detector「先分清哪些變化是預期的，才有辦法對非預期的
         #   變化發警報」；否則每次請求都在漂，警報等於雜訊。）
         for i, message in enumerate(messages[:-1]):
-            if len(out) >= MAX_FINDINGS:
-                return out
+            if out.full:
+                return out.result()
             if isinstance(message, dict) and "content" in message:
                 _scan_content(message["content"], f"messages[{i}].content", out)
 
     tools = body.get("tools")
     if isinstance(tools, list):
         for i, tool in enumerate(tools):
-            if len(out) >= MAX_FINDINGS:
-                return out
+            if out.full:
+                return out.result()
             if not isinstance(tool, dict):
                 continue
             description = tool.get("description")
@@ -145,58 +230,100 @@ def detect_volatile_content(body: dict) -> list[VolatileFinding]:
             if "input_schema" in tool:
                 _scan_value(tool["input_schema"], f"tools[{i}].input_schema", out)
 
-    return out
+    return out.result()
+
+
+class _Accumulator:
+    """依 `(kind, location)` 去重的收集器。
+
+    上限算的是**相異位置**而非命中次數。初版兩者不分，review 實測：三則
+    含時間戳的凍結歷史就吃滿 10 個名額（只覆蓋 3 個相異位置），把 tools
+    裡唯一真正該報的 `session_id` 完全擠掉 —— 噪音之外還會漏報。
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[tuple[str, str], int] = {}
+        self._samples: dict[tuple[str, str], str] = {}
+        self.truncated = False
+
+    def add(self, kind: str, location: str, sample: str) -> None:
+        key = (kind, location)
+        if key in self._counts:
+            self._counts[key] += 1
+            return
+        if len(self._counts) >= MAX_FINDINGS:
+            self.truncated = True
+            return
+        self._counts[key] = 1
+        self._samples[key] = sample
+
+    @property
+    def full(self) -> bool:
+        """撞上限後就停止走訪（別為了數重複而掃完整份 body）。"""
+        return self.truncated
+
+    def result(self) -> VolatileScan:
+        return VolatileScan(
+            [
+                VolatileFinding(kind=k, location=loc, sample=self._samples[(k, loc)], count=n)
+                for (k, loc), n in self._counts.items()
+            ],
+            self.truncated,
+        )
 
 
 # ─── 走訪 ──────────────────────────────────────────────────────────────
 
 
-def _scan_content(value, location: str, out: list[VolatileFinding]) -> None:
-    """content 位置：可能是字串、可能是 block 陣列、也可能是 object。"""
-    if len(out) >= MAX_FINDINGS:
+def _scan_content(value, location: str, out: _Accumulator) -> None:
+    """content 位置：可能是字串、可能是 block 陣列、也可能是 object。
+
+    行為與 `_scan_value` 等價（前者的 object 分支直接委派後者）；保留兩個
+    名字只為與解答本的 `scan_value_for_strings` / `scan_value_recursive`
+    結構對齊，Rust 端同樣拆分。
+    """
+    if out.full:
         return
     if isinstance(value, str):
         _scan_string(value, location, out)
     elif isinstance(value, list):
         for i, item in enumerate(value):
-            if len(out) >= MAX_FINDINGS:
+            if out.full:
                 return
             _scan_value(item, f"{location}[{i}]", out)
     elif isinstance(value, dict):
         _scan_value(value, location, out)
 
 
-def _scan_value(value, location: str, out: list[VolatileFinding]) -> None:
+def _scan_value(value, location: str, out: _Accumulator) -> None:
     """唯一會檢查 **key 名稱** 的走訪器：tool input_schema、巢狀 block
-    都流經這裡。"""
-    if len(out) >= MAX_FINDINGS:
+    都流經這裡。
+
+    遞迴深度由 `scan_request` 的 MAX_NESTING 前置檢查擋住 —— 那個檢查是
+    迭代實作的，正是為了不用遞迴去防遞迴。（初版沒有它，depth 1000 的
+    body 會讓這裡拋 RecursionError，直接違反「絕不拋例外」的契約；而
+    `except (ValueError, ...)` 也接不住，RecursionError 不是 ValueError。）
+    """
+    if out.full:
         return
     if isinstance(value, str):
         _scan_string(value, location, out)
     elif isinstance(value, list):
         for i, item in enumerate(value):
-            if len(out) >= MAX_FINDINGS:
+            if out.full:
                 return
             _scan_value(item, f"{location}[{i}]", out)
     elif isinstance(value, dict):
         for key, sub in value.items():
-            if len(out) >= MAX_FINDINGS:
+            if out.full:
                 return
             if _is_id_named_key(key) and not _is_value_empty(sub):
-                out.append(
-                    VolatileFinding(
-                        kind=ID_FIELD,
-                        location=f"{location}.{key}",
-                        sample=_truncate_sample(_value_to_sample(sub)),
-                    )
-                )
-                if len(out) >= MAX_FINDINGS:
-                    return
+                out.add(ID_FIELD, f"{location}.{key}", _describe(sub))
             _scan_value(sub, f"{location}.{key}", out)
 
 
-def _scan_string(text: str, location: str, out: list[VolatileFinding]) -> None:
-    """在一段字串裡找時間戳與 UUID v4。同一段字串裡多次命中各記一筆。
+def _scan_string(text: str, location: str, out: _Accumulator) -> None:
+    """在一段字串裡找時間戳與 UUID v4。同一段字串裡多次命中累加 count。
 
     這裡逐 **code point** 掃，Rust 端逐 **byte** 掃 —— 兩邊的索引不同，
     但兩個 pattern 都是純 ASCII，所以認出來的是同一個子字串、跳過的也是
@@ -206,27 +333,15 @@ def _scan_string(text: str, location: str, out: list[VolatileFinding]) -> None:
     n = len(text)
     i = 0
     while i < n:
-        if len(out) >= MAX_FINDINGS:
+        if out.full:
             return
         # 先試 ISO-8601：視窗較短，字串剛好在 UUID 中間結束時比較不會漏。
         if i + _ISO_LEN <= n and _looks_like_iso8601(text, i):
-            out.append(
-                VolatileFinding(
-                    kind=TIMESTAMP,
-                    location=location,
-                    sample=_truncate_sample(text[i : i + _ISO_LEN]),
-                )
-            )
+            out.add(TIMESTAMP, location, text[i : i + _ISO_LEN])
             i += _ISO_LEN
             continue
         if i + _UUID_LEN <= n and _looks_like_uuid_v4(text, i):
-            out.append(
-                VolatileFinding(
-                    kind=UUID_V4,
-                    location=location,
-                    sample=_truncate_sample(text[i : i + _UUID_LEN]),
-                )
-            )
+            out.add(UUID_V4, location, text[i : i + UUID_SAMPLE_CHARS] + "…")
             i += _UUID_LEN
             continue
         i += 1
@@ -271,9 +386,7 @@ def _looks_like_uuid_v4(s: str, at: int) -> bool:
         return False
     if s[at + 19] not in ("8", "9", "a", "b", "A", "B"):
         return False
-    return all(
-        _is_ascii_hex(s[at + k]) for k in range(_UUID_LEN) if k not in (8, 13, 18, 23)
-    )
+    return all(_is_ascii_hex(s[at + k]) for k in range(_UUID_LEN) if k not in (8, 13, 18, 23))
 
 
 def _is_id_named_key(key: str) -> bool:
@@ -297,20 +410,94 @@ def _is_value_empty(value) -> bool:
     return False
 
 
-def _value_to_sample(value) -> str:
-    """把 JSON 值渲染成短樣本。數字已經是原始字面值的字串（見 scan_request
-    的 parse_float/parse_int），直接用即可。"""
+def _describe(value) -> str:
+    """把值渲染成**型別描述**，絕不含值本身（見模組 docstring 的 sample 政策）。
+
+    長度以字元計（Rust 端用 `chars().count()`）—— 用 byte 會讓非 ASCII 值
+    的描述在兩邊分岔。
+    """
     if isinstance(value, str):
-        return value
-    if value is None:
-        return "null"
+        return f"string[{len(value)}]"
+    # bool 必須排在 int 之前 —— Python 的 bool 是 int 的子類。
     if isinstance(value, bool):
-        return "true" if value else "false"
-    # list / dict：用 compact JSON，反正下面還會截斷。
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return f"array[{len(value)}]"
+    if isinstance(value, dict):
+        return f"object[{len(value)}]"
+    return "null"
 
 
-def _truncate_sample(s: str) -> str:
-    if len(s) <= SAMPLE_MAX_CHARS:
-        return s
-    return s[:SAMPLE_MAX_CHARS] + "…"
+# ─── 輸入收斂（與 serde_json 的判準對齊）───────────────────────────────
+
+
+def _reject_constant(name: str):
+    """`NaN` / `Infinity` / `-Infinity`：serde_json 一律 Err，這裡跟著拒收。
+
+    拋 ValueError 讓 `scan_request` 既有的 except 接住 —— 而且要注意 Rust
+    是**整包** parse 失敗，所以拒收的粒度也必須是整份文件，不是那個欄位。
+    """
+    raise ValueError(f"JSON 常數 {name} 不被接受（與 serde_json 對齊）")
+
+
+def _has_lone_surrogate_escape(text: str) -> bool:
+    """原始 JSON 文字裡有沒有落單的 surrogate 跳脫。
+
+    Python 的 json 會把 `\\ud800` 解成一個無法編碼成 UTF-8 的 str，
+    serde_json 則要求 high/low 成對、否則整包 Err。**成對的必須放行**
+    （`\\ud83d\\ude00` 是合法的 emoji），所以不能無腦擋掉所有 surrogate ——
+    守門要同時測「該擋的擋了」與「該過的還會過」。
+    """
+    i = 0
+    n = len(text)
+    while True:
+        i = text.find("\\u", i)
+        if i < 0:
+            return False
+        # 往回數連續反斜線；偶數個代表它們兩兩成對，這個 `u` 是普通字元。
+        start = i
+        while start > 0 and text[start - 1] == "\\":
+            start -= 1
+        if (i - start + 1) % 2 == 0:
+            i += 2
+            continue
+        code = _hex4(text, i + 2)
+        if code is None:
+            i += 2
+            continue
+        if 0xDC00 <= code <= 0xDFFF:
+            return True  # 落單的 low surrogate
+        if 0xD800 <= code <= 0xDBFF:
+            if text[i + 6 : i + 8] != "\\u":
+                return True
+            low = _hex4(text, i + 8)
+            if low is None or not (0xDC00 <= low <= 0xDFFF):
+                return True
+            i += 12
+            continue
+        i += 6
+
+
+def _hex4(text: str, at: int) -> int | None:
+    chunk = text[at : at + 4]
+    if len(chunk) < 4 or not all(_is_ascii_hex(c) for c in chunk):
+        return None
+    return int(chunk, 16)
+
+
+def _nesting_depth(obj) -> int:
+    """最大容器巢狀深度。**迭代實作** —— 用遞迴去量遞迴深度，量到一半就
+    自己爆了，正是這個函式要防的事。"""
+    depth = 0
+    stack = [(obj, 1)]
+    while stack:
+        node, d = stack.pop()
+        if d > depth:
+            depth = d
+        children = node.values() if isinstance(node, dict) else node
+        for child in children:
+            if isinstance(child, (dict, list)):
+                stack.append((child, d + 1))
+    return depth
