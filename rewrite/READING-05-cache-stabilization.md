@@ -173,3 +173,56 @@ and benign, and hashes bearer tokens before they leave the module.
 A zero-risk next build for the rebuild: a read-only volatile scan that emits an observation line
 when the cached prefix contains a timestamp or a v4 UUID. It cannot affect parity or any
 existing fixture, and it fills in the half of Phase E that is entirely absent.
+
+---
+
+# 附錄：實測結果（2026-08-09）
+
+上面提議的實驗跑了。**原問題無法回答，但量到了更有決定性的東西。**
+
+方法：對真 `api.anthropic.com`（OAuth bearer + `oauth-2025-04-20`，haiku-4-5，
+前綴約 9.1k token）。憑證走 `600` 權限的 curl config 檔、不進 argv，跑完刪除。
+
+## 前提沒成立，所以原問題仍未知
+
+要測「重排是否 forfeit 部分命中容錯」，前提是對照組得先展現出那個容錯：
+
+| ARM | 動作 | create | read |
+|---|---|---|---|
+| RAW（未正規化） | 重送相同 body | 0 | **9086** |
+| RAW | tools 內文漂移 | 9086 | **0** |
+| NORM（已重排） | 重送相同 body | 0 | **9086** |
+| NORM | tools 內文漂移 | 9086 | **0** |
+
+兩組完全相同，而且 **raw 對照組遇到內文漂移也是 `read=0`** —— M8 記錄的 ~30k 部分命中
+容錯在本設定下沒有出現。**前提不成立就不能下結論**，所以「重排是否打掉容錯」仍然未知。
+（依 M8 自己那句「下結論前先驗證實驗的前提差異真的存在」，不把「兩組一樣」講成「重排無害」。）
+
+要把這條追到底，得用 M8 的錄音 proxy 抓真實 Claude Code 流量重放 —— 合成 body 撐不出那個現象。
+
+## 順序漂移的實測是決定性的
+
+tools 渲染在 system **之前**，所以任何 tools 變動都會作廢整段前綴。只有順序不同的兩份請求：
+
+| | create | read |
+|---|---|---|
+| 順序漂移 · **未正規化** | **9088**（快取重付一次） | 0 |
+| 順序漂移 · **經 stabilize** | 0 | **9088**（全命中） |
+
+**M3 的宣稱被實測證實，效益是每次請求 9,088 token。** 且正規化在穩態完全不傷。
+
+→ 對「M3 該不該加 auth-mode 閘門」：**目前沒有證據支持要加**，而有實測證據支持它的價值。
+要加閘門的理由若存在，得先讓那個 ~30k 容錯重現才談得上。
+
+## [TRAP] 標記放了不等於快取到了
+
+第一版把 `cache_control` 放在**最後一個 tool** 上 → `create=0`，什麼都沒快取到。
+原因：它只涵蓋 tools 那一段，而該段遠低於 haiku 的最低快取門檻；9.4k token 幾乎全在
+system，而 system 在渲染序上排在 tools **之後**。移到 system 末尾才 `create=9086`。
+
+**若沒先跑探針就直接開跑，會拿到一整排 `read=0` 然後得出「重排會炸掉快取」的錯誤結論**
+—— 實際上是整個實驗根本沒快取到任何東西。這與本系列反覆遇到的「空的比對安靜地印通過」
+是同一個形狀。
+
+順帶驗證：重建 `_place_breakpoints` 把標記放在 system 末尾 ＋ live zone 前一則訊息，
+**實測是對的擺法**。
