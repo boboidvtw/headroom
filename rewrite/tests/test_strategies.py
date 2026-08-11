@@ -380,7 +380,13 @@ def test_search_registered_after_diff_before_log():
 # → 未認出的行灌大比率閘門的分母（可丟/總行 >= 0.3）→ 佔比 0.625→0.208 → 策略自己關掉、
 # 落盲目截斷。修法照工業版：錨在**行號標記** `<sep>\d+<sep>`（sep ∈ `:` `-`），而非擴充
 # 路徑字元集 —— 錨在受限欄位不錨在自由欄位。
-from headroom_lite.strategies import LINE_CONTEXT, LINE_MATCH, LINE_OTHER
+from headroom_lite.strategies import (
+    LINE_CONTEXT,
+    LINE_MATCH,
+    LINE_OTHER,
+    _classify_lines,
+    _search_drop_flags,
+)
 
 
 def _rg_context(n_files: int = 3, per_file: int = 12, ctx: int = 1) -> str:
@@ -399,8 +405,10 @@ def _rg_context(n_files: int = 3, per_file: int = 12, ctx: int = 1) -> str:
 
 def test_search_match_line_recognises_rg_context_dash():
     # M24 核心：`-` 分隔的 context 行必須被認得，且身分是 context 而非 match。
-    kind, key = _match_line_key("./src/main.py-40-    context here")
-    assert kind == LINE_CONTEXT and key == "./src/main.py"
+    # review 回合後 context 的判定需要整段的檔名白名單（單獨一行無法分辨
+    # `./src/step-2-runner.py-41-ctx` 的哪個 `-` 才是標記），所以走 _classify_lines。
+    kinds = _classify_lines(["./src/main.py:39:hit", "./src/main.py-40-    context here"])
+    assert kinds[1] == (LINE_CONTEXT, "./src/main.py")
 
 
 def test_search_match_line_kind_is_match_for_colon():
@@ -461,6 +469,79 @@ def test_search_match_line_accepts_path_with_spaces():
     assert kind == LINE_MATCH and key == "./my dir/foo.py"
     kind, key = _match_line_key("./My Documents/src/a.py:7:x")
     assert kind == LINE_MATCH and key == "./My Documents/src/a.py"
+
+
+# ── M24 review 回合：三支 reviewer 的七條指控，每條複驗後都成立 ──
+
+
+def test_search_recognises_filename_containing_dash_digit_dash():
+    # [CRITICAL] 取最早候選 → `step-2-runner.py` 的 `-2-` 先被錨中，path 被切成 `./src/step`。
+    # 病灶不是誤判本身，是 blast radius：match 行認不得 → 整段 applies 關掉 → 落盲目截斷，
+    # 正是 M24 要修的病自己重演。這種檔名一點都不罕見（migration/step/part/版本號）。
+    for f in ["./src/step-2-runner.py", "./src/part-1-of-5.csv", "./db/v1-2-migrate.sql"]:
+        kind, key = _match_line_key(f + ":42:    result = compute(value)")
+        assert (kind, key) == (LINE_MATCH, f), f"{f} 的 match 行認不得"
+
+
+def test_search_applies_on_file_with_dash_digit_dash_name():
+    text = "\n".join(
+        f"./src/step-2-runner.py:{ln + 1}:    result = compute(value_{ln})" for ln in range(12)
+    )
+    assert SEARCH.applies(text) is True, "整段 SEARCH 不該因檔名形狀而自己關掉"
+
+
+def test_search_context_line_under_dash_digit_dash_filename():
+    # context 行也要歸到對的檔案（`-2-` 不是標記、`-41-` 才是）——靠「path 必須是某個
+    # 命中行認過的檔案」這條白名單判定，而不是靠猜哪個候選才對。
+    lines = ["./src/step-2-runner.py:42:hit", "./src/step-2-runner.py-41-ctx"]
+    kinds = [_classify_lines(lines)[i] for i in (0, 1)]
+    assert kinds[0] == (LINE_MATCH, "./src/step-2-runner.py")
+    assert kinds[1] == (LINE_CONTEXT, "./src/step-2-runner.py")
+
+
+def test_search_recognises_grep_line_with_timestamp_prefix():
+    # [HIGH] 早期候選失敗就整個放棄、不繼續往右掃 → 帶時間戳前綴的 grep 輸出完全認不得
+    # （`2026` 無 `/` 就 return 了）。M14 認得這種行，M24 不得讓它退步。
+    kind, key = _match_line_key("2026-06-20 ./src/foo.py:42:hit")
+    assert kind == LINE_MATCH and key.endswith("./src/foo.py")
+
+
+def test_search_ideographic_space_does_not_bypass_the_guard():
+    # [MEDIUM] 舊防線是「path 不得含 ASCII 空白」——U+3000 全形空白直接繞過，
+    # 而這個 milestone 的主題就是 CJK。改用白名單（path 必須是命中行認過的檔案）之後，
+    # 這一族繞法整個消失：不是列舉更多空白字元，而是換掉「列舉」這個作法。
+    assert _match_line_key("/usr/src/app.py　2026-06-20 boom")[0] == LINE_OTHER
+    assert _match_line_key("/usr/src/app.py 2026-06-20 boom")[0] == LINE_OTHER
+
+
+def test_search_no_orphan_context_when_files_interleave():
+    # [HIGH] 歸屬原本用「全域最近命中」再事後篩同檔 —— 別的檔案的命中插在中間，
+    # 就把同檔命中擋掉了，落到「找不到 owner → 保留」，留下孤兒 context。
+    # 文件宣稱的不變量是「丟掉的命中連同 context 一起丟」，這裡直接鎖住它。
+    lines = [
+        "./a.py:1:hit", "./a.py:2:hit", "./a.py:3:hit",
+        "./a.py:4:hit",      # 第 4 筆 → 超過 KEEP_PER_FILE，丟
+        "./b.py:100:hit",    # 別的檔案插在中間
+        "./a.py-5-ctx",      # 屬於被丟的第 4 筆 → 必須一起丟
+    ]
+    flags = _search_drop_flags(lines)
+    assert flags[3] is True, "第 4 筆命中該被丟"
+    assert flags[5] is True, "被丟命中的 context 不得留成孤兒"
+
+
+def test_search_context_tie_breaks_to_the_earlier_match():
+    # [HIGH] 「平手取前者」在三處文件被當成刻意設計講，卻沒有任何測試產生真正的平手 ——
+    # 把 `<=` 翻成 `<` 兩語言 214/201 個測試全綠，而 parity 只比對兩語言一致，
+    # 同時翻轉會靜默通過。這裡造一個前後距離都是 1 的 context 行，且前者保留、後者丟棄，
+    # 於是「取前者」與「取後者」會給出不同答案。
+    lines = [
+        "./a.py:1:hit", "./a.py:2:hit", "./a.py:3:hit",  # 前 3 筆保留
+        "./a.py-4-ctx",   # i=3：前 owner=i2(距 1, 保留)、後 owner=i4(距 1, 丟棄)
+        "./a.py:5:hit",   # 第 4 筆命中 → 丟
+    ]
+    flags = _search_drop_flags(lines)
+    assert flags[4] is True, "第 4 筆命中該被丟"
+    assert flags[3] is False, "平手時取前者（保留的那筆）→ context 跟著保留"
 
 
 def test_search_claims_grep_output_under_a_path_with_spaces():

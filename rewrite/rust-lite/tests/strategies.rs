@@ -398,6 +398,92 @@ fn search_plain_grep_not_regressed() {
     assert!((SEARCH.applies)(&search_default()));
 }
 
+// ── M24 review 回合：三支 reviewer 的七條指控，每條複驗後都成立（對齊 Python）──
+
+#[test]
+fn search_applies_on_file_with_dash_digit_dash_name() {
+    // [CRITICAL] 取最早候選 → `step-2-runner.py` 的 `-2-` 先被錨中，path 被切成
+    // `./src/step`。傷害不是這行判錯，而是整段 SEARCH 自己關掉 → 落盲目截斷，
+    // 正是 M24 要修的病重演。這種檔名不罕見（migration/step/part/版本號）。
+    for name in [
+        "./src/step-2-runner.py",
+        "./src/part-1-of-5.csv",
+        "./db/v1-2-migrate.sql",
+    ] {
+        let text: String = (0..12)
+            .map(|ln| format!("{name}:{}:    result = compute(value_{ln})", ln + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            (SEARCH.applies)(&text),
+            "{name}：整段 SEARCH 不該因檔名形狀而自己關掉"
+        );
+    }
+}
+
+#[test]
+fn search_recognises_grep_line_with_timestamp_prefix() {
+    // [HIGH] 早期候選失敗就整個放棄、不繼續往右掃 → 帶時間戳前綴的 grep 輸出認不得。
+    let text: String = (0..12)
+        .map(|ln| format!("2026-06-20 ./src/foo.py:{}:hit_{ln}", ln + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!((SEARCH.applies)(&text), "帶時間戳前綴的 grep 輸出該被認領");
+}
+
+#[test]
+fn search_ideographic_space_does_not_bypass_the_guard() {
+    // [MEDIUM] 舊防線「path 不得含 ASCII 空白」被 U+3000 全形空白繞過，而本里程碑的
+    // 主題正是 CJK。改用白名單後這一族繞法整個消失（換掉「列舉」這個作法本身）。
+    let log: String = (0..40)
+        .map(|i| format!("/usr/src/app.py\u{3000}2026-06-20 event {i} happened"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(SEARCH.applies)(&log), "全形空白的 log 行不得被 search 認領");
+}
+
+#[test]
+fn search_no_orphan_context_when_files_interleave() {
+    // [HIGH] 歸屬原本用「全域最近命中」再事後篩同檔 —— 別的檔案的命中插在中間就把
+    // 同檔命中擋掉，落到「找不到 owner → 保留」，留下孤兒 context。
+    let text = [
+        "./a.py:1:hit",
+        "./a.py:2:hit",
+        "./a.py:3:hit",
+        "./a.py:4:hit",   // 第 4 筆 → 超過 KEEP_PER_FILE，丟
+        "./b.py:100:hit", // 別的檔案插在中間
+        "./a.py-5-ctx",   // 屬於被丟的第 4 筆 → 必須一起丟
+    ]
+    .join("\n");
+    let out = (SEARCH.squeeze)(&text).expect("有超量可丟");
+    assert!(!out.contains("./a.py:4:"), "第 4 筆命中該被丟");
+    assert!(
+        !out.contains("./a.py-5-ctx"),
+        "被丟命中的 context 不得留成孤兒"
+    );
+}
+
+#[test]
+fn search_context_tie_breaks_to_the_earlier_match() {
+    // [HIGH]「平手取前者」在三處文件被當刻意設計講，卻沒有測試產生真正的平手 ——
+    // 把 `<=` 翻成 `<`，兩語言全部測試仍綠，而 parity 只比對兩語言一致，同時翻轉
+    // 會靜默通過。這裡造一個前後距離都是 1、且前者保留後者丟棄的 context 行。
+    let text = [
+        "./a.py:1:hit",
+        "./a.py:2:hit",
+        "./a.py:3:hit",
+        "./a.py-4-ctx", // 前 owner 距 1(保留)、後 owner 距 1(丟棄) → 平手取前者
+        "./a.py:5:hit", // 第 4 筆命中 → 丟
+    ]
+    .join("\n");
+    let out = (SEARCH.squeeze)(&text).expect("有超量可丟");
+    assert!(!out.contains("./a.py:5:"), "第 4 筆命中該被丟");
+    assert!(
+        out.contains("./a.py-4-ctx"),
+        "平手取前者（保留的那筆）→ context 跟著保留"
+    );
+}
+
 #[test]
 fn search_claims_grep_output_under_a_path_with_spaces() {
     // M24 回歸守門：M14 認領含空白的路徑（macOS 常見），M24 不得讓它退步。

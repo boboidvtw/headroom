@@ -297,51 +297,90 @@ LINE_CONTEXT = "context"
 LINE_OTHER = ""
 
 
-def _match_line_key(line: str):
-    """grep/rg 行判斷：回 (kind, file_key)，kind ∈ LINE_MATCH/LINE_CONTEXT/LINE_OTHER。
+def _marker_paths(line: str, sep: str) -> list[str]:
+    """列出行內所有「`sep` 型行號標記」`<sep>\\d+<sep>` 之前的 path 候選，由左而右。
 
-    M24：**錨在行號標記 `<sep>\\d+<sep>`（sep ∈ `:` `-`），不錨在路徑**。取行內最早的
-    標記，其前為路徑、其後為內容；開頭的 sep 決定身分（`:` 命中、`-` 是 rg -C 的 context）。
-    這樣檔名含 `-` 不再破壞判讀，`rg -C` 的 context 行也終於被認得。
+    只認 ASCII 數字（與 Rust `is_ascii_digit` 逐字節對齊；不用 str.isdigit 認 unicode）。
+    候選必須非空且含 `/` —— 後者擋掉 log 時間戳（`10:30:45` 的 `10`、`2026-06-20` 的
+    `2026` 都沒有 `/`）。
 
-    三道防線（缺一就誤判，都測過）：
-      1. 路徑非空 —— 行首即標記（`:42:x`）不算。
-      2. 路徑須含 `/` —— 擋 log 時間戳。M24 後這條更吃重：`2026-06-20` 的 `-06-` 本身就是
-         一個合法的行號標記，全靠 `/` 把它擋在門外。
-      3. **`-` 型標記**的路徑不得含空白 —— 錨定改動自帶的新誤判面：prefix 現在是「標記前
-         的一切」，於是 `/usr/src/app.py 2026-06-20 boom` 這類內嵌路徑的 log 行會被 `-06-`
-         錨中且含 `/`。
-
-    第 3 條為何只套 `-` 型：時間戳的威脅**完全來自「允許 `-` 當 sep」這個新增面**；
-    `:` 型 + `/` 檢查已由 M14 驗證足夠（`10:30:45` 的 path `10` 無 `/`）。若把空白檢查也
-    套到 `:` 型，`./my dir/foo.py:42:hit`（macOS 上很常見）會從 M14 的「認領」退化成
-    「不認領」—— 等於為了修「策略自己關掉」而引進另一個「策略自己關掉」。**防線要加在
-    新增的威脅面上，不是加在原本就安全的路徑上。**
-
-    已知限制兩則（都是落回 truncate 兜底、不會產出錯輸出）：
-      - 檔名本身形如 `a-1-b.py` 會讓最早標記落在檔名內而誤判成 context（工業版取最早
-        標記也有同樣特性，這種檔名罕見）。
-      - 含空白路徑的 rg **context** 行（`./my dir/a.py-42-ctx`）被第 3 條擋下 → 不認領、
-        一律保留；該檔的 match 行仍正常認領，只是壓縮率略低。
+    **回傳全部候選、而不是碰到第一個就定案**，是 review 回合修掉的一條 HIGH：原本
+    「取最早候選，失敗就 return」讓 `2026-06-20 ./src/foo.py:42:hit` 這種帶時間戳前綴的
+    grep 輸出整行認不得（`2026` 無 `/` 就放棄了，右邊真正的 `:42:` 從沒被看到）。
     """
+    out: list[str] = []
     n = len(line)
     i = 0
     while i < n:
-        c = line[i]
-        if c == ":" or c == "-":
+        if line[i] == sep:
             j = i + 1
-            # 刻意只認 ASCII 數字（與 Rust `is_ascii_digit` 逐字節對齊；不用 str.isdigit）
             while j < n and 0x30 <= ord(line[j]) <= 0x39:
                 j += 1
             if j > i + 1 and j < n and (line[j] == ":" or line[j] == "-"):
                 path = line[:i]
-                if not path or "/" not in path:
-                    return LINE_OTHER, ""
-                if c == "-" and (" " in path or "\t" in path):
-                    return LINE_OTHER, ""
-                return (LINE_MATCH if c == ":" else LINE_CONTEXT), path
+                if path and "/" in path:
+                    out.append(path)
         i += 1
+    return out
+
+
+def _match_line_key(line: str):
+    """單行的**命中行**判斷：回 (LINE_MATCH, file_key) 或 (LINE_OTHER, "")。
+
+    命中行是 `:` 型標記（`file:lineno:content`）。context 行要靠整段的檔名白名單才能
+    判定，見 `_classify_lines` —— 單獨一行無法可靠地分辨
+    `./src/step-2-runner.py-41-ctx` 的哪個 `-` 才是標記。
+    """
+    for path in _marker_paths(line, ":"):
+        return LINE_MATCH, path
     return LINE_OTHER, ""
+
+
+def _classify_lines(lines: list[str]) -> list[tuple[str, str]]:
+    """兩趟分類：先認命中行建立檔名白名單，再用白名單認 context 行。
+
+    **為何是兩趟（review 回合的核心修正）**：原本「取行內最早的 `<sep>\\d+<sep>` 標記」
+    在檔名含 `-數字-` 時整個垮掉 —— `./src/step-2-runner.py:42:hit` 的 `-2-` 比真標記
+    `:42:` 更早，path 被切成 `./src/step`。而且傷害不是「這行判錯」而是**整段 SEARCH
+    自己關掉**（命中行認不得 → 可丟數為 0 → 比率閘門不認領 → 落盲目截斷），正是 M24
+    要修的那個病自己重演。這種檔名一點都不罕見：migration、step、part、版本號都是。
+
+    白名單的作法：命中行的 `:` 型標記歧義小（路徑不含 `:`，Windows 路徑已被 `/` 擋在
+    門外），先掃出所有命中行的 file_key；context 行再從自己的 `-` 型候選裡挑**出現在
+    白名單中**的那一個。於是 `-2-`（→`./src/step`）被排除、`-41-`（→`./src/step-2-runner.py`）
+    中選 —— 不是猜哪個候選才對，而是問「這個 path 是某個命中行認過的檔案嗎」。
+
+    **這條白名單同時換掉了原本的空白黑名單**：舊防線「`-` 型的 path 不得含 ASCII 空白」
+    被 U+3000 全形空白直接繞過（而這個里程碑的主題正是 CJK 路徑）。與其列舉更多空白
+    字元 —— 那是開放集合 —— 不如換掉「列舉」這個作法本身：不在白名單裡的 path 一律不是
+    context 行，`/usr/src/app.py<U+3000>2026-06-20 boom` 因此自然出局。
+
+    白名單只做查找、從不迭代 → 無雜湊順序依賴（parity）。
+
+    已知限制（都落回 truncate 兜底或保守保留，不會產出錯輸出）：
+      - context 行的**內容**若含 `:數字:`（例如程式碼裡的時間戳字面值），該行會被當成
+        命中行。後果是它被保守地保留而非跟隨 owner，不會誤丟資料。這是拿它換掉上面那個
+        「整段關掉」的 CRITICAL —— 兩者不可兼得時，選傷害小的。
+      - Windows 反斜線路徑（`C:\\Users\\me\\foo.py:42:hit`）不認領：`/` 檢查要求正斜線。
+        自 M14 起如此，非 M24 引入。
+      - `rg --heading` / `--no-filename` 的無路徑輸出（`42:content`）不認領，同樣自 M14 起。
+    """
+    known: dict[str, int] = {}
+    parsed: list[tuple[str, str]] = []
+    for line in lines:
+        kind, key = _match_line_key(line)
+        parsed.append((kind, key))
+        if kind == LINE_MATCH:
+            known[key] = 1
+
+    for i, (kind, _) in enumerate(parsed):
+        if kind != LINE_OTHER:
+            continue
+        for path in _marker_paths(lines[i], "-"):
+            if path in known:  # 只查找、不迭代 → 無雜湊順序依賴
+                parsed[i] = (LINE_CONTEXT, path)
+                break
+    return parsed
 
 
 def _search_drop_flags(lines: list[str]) -> list[bool]:
@@ -352,10 +391,16 @@ def _search_drop_flags(lines: list[str]) -> list[bool]:
     rg 的排版下這正好把 `after` 歸前一個命中、`before` 歸後一個命中，於是保留的命中連同
     context 一起保、丟掉的一起丟（不留孤兒 context）。
 
-    只用 dict 做計數查找、從不迭代 dict；歸屬用純索引數學（前向/後向各一趟）——
+    只用 dict 做查找、從不迭代 dict；歸屬用純索引數學（前向/後向各一趟）——
     結果僅依輸入順序，無雜湊順序依賴（parity）。
+
+    **前向/後向表是 per-key 的（review 回合修掉的一條 HIGH）**：原本只追一個「全域最近
+    命中」再事後篩同檔，於是**別的檔案的命中插在中間就把同檔命中擋掉了** —— 歸屬落到
+    「找不到 owner → 保留」，被丟的命中留下孤兒 context，違反這支函式自己宣稱的不變量。
+    單次 `rg -C` 的輸出同檔連續、踩不到；但 headroom 壓的是 agent 串接起來的 tool_result，
+    多次搜尋結果貼在一起是正常情境，而測試的產生器結構上從不產生交錯輸入。
     """
-    parsed = [_match_line_key(line) for line in lines]
+    parsed = _classify_lines(lines)
     n = len(lines)
 
     # 命中行的去留：每個 file_key 計數，超過上限即丟。
@@ -366,30 +411,31 @@ def _search_drop_flags(lines: list[str]) -> list[bool]:
             counts[key] = counts.get(key, 0) + 1
             flags[i] = counts[key] > KEEP_PER_FILE
 
-    # 前向一趟：每個位置「最近的前一個命中」的 (index, key)。
+    # 前向一趟：每個位置「同一個 key 最近的前一個命中」的 index（-1 = 沒有）。
     prev_idx: list[int] = [-1] * n
-    prev_key: list[str] = [""] * n
-    last = -1
+    last_by_key: dict[str, int] = {}
     for i, (kind, key) in enumerate(parsed):
-        prev_idx[i], prev_key[i] = last, (parsed[last][1] if last >= 0 else "")
+        if kind == LINE_CONTEXT:
+            prev_idx[i] = last_by_key.get(key, -1)
         if kind == LINE_MATCH:
-            last = i
+            last_by_key[key] = i
 
-    # 後向一趟：每個位置「最近的後一個命中」的 (index, key)。
+    # 後向一趟：每個位置「同一個 key 最近的後一個命中」的 index（-1 = 沒有）。
     next_idx: list[int] = [-1] * n
-    next_key: list[str] = [""] * n
-    last = -1
+    last_by_key = {}
     for i in range(n - 1, -1, -1):
-        next_idx[i], next_key[i] = last, (parsed[last][1] if last >= 0 else "")
-        if parsed[i][0] == LINE_MATCH:
-            last = i
+        kind, key = parsed[i]
+        if kind == LINE_CONTEXT:
+            next_idx[i] = last_by_key.get(key, -1)
+        if kind == LINE_MATCH:
+            last_by_key[key] = i
 
     # context 行歸屬：距離小者勝，平手取前者；無同檔命中則保留。
     for i, (kind, key) in enumerate(parsed):
         if kind != LINE_CONTEXT:
             continue
-        before_ok = prev_idx[i] >= 0 and prev_key[i] == key
-        after_ok = next_idx[i] >= 0 and next_key[i] == key
+        before_ok = prev_idx[i] >= 0
+        after_ok = next_idx[i] >= 0
         if before_ok and after_ok:
             owner = prev_idx[i] if (i - prev_idx[i]) <= (next_idx[i] - i) else next_idx[i]
         elif before_ok:

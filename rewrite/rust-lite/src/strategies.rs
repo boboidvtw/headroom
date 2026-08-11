@@ -331,60 +331,91 @@ enum LineKind {
     Context,
 }
 
-/// grep/rg 行判斷：回 `Some((kind, file_key))` 或 `None`。
+/// 列出行內所有「`sep` 型行號標記」`<sep>\d+<sep>` 之前的 path 候選，由左而右。
 ///
-/// M24：**錨在行號標記 `<sep>\d+<sep>`（sep ∈ `:` `-`），不錨在路徑**。取行內最早的
-/// 標記，其前為路徑、其後為內容；開頭的 sep 決定身分（`:` 命中、`-` 是 rg -C 的 context）。
-/// 檔名含 `-` 不再破壞判讀，`rg -C` 的 context 行也終於被認得。
+/// 候選必須非空且含 `/` —— 後者擋掉 log 時間戳（`10:30:45` 的 `10`、`2026-06-20` 的
+/// `2026` 都沒有 `/`）。**回傳全部候選、而不是碰到第一個就定案**，是 review 回合修掉的
+/// 一條 HIGH：原本「取最早候選，失敗就 return」讓 `2026-06-20 ./src/foo.py:42:hit`
+/// 這種帶時間戳前綴的 grep 輸出整行認不得（`2026` 無 `/` 就放棄了，右邊真正的 `:42:`
+/// 從沒被看到）。
 ///
-/// 三道防線（缺一就誤判，都測過）：
-///   1. 路徑非空 —— 行首即標記（`:42:x`）不算。
-///   2. 路徑須含 `/` —— 擋 log 時間戳。M24 後這條更吃重：`2026-06-20` 的 `-06-` 本身就是
-///      一個合法行號標記，全靠 `/` 把它擋在門外。
-///   3. **`-` 型標記**的路徑不得含空白 —— 錨定改動自帶的新誤判面：prefix 現在是「標記前
-///      的一切」，於是 `/usr/src/app.py 2026-06-20 boom` 會被 `-06-` 錨中且含 `/`。
-///
-/// 第 3 條為何只套 `-` 型：時間戳的威脅**完全來自「允許 `-` 當 sep」這個新增面**；
-/// `:` 型 + `/` 檢查已由 M14 驗證足夠。若把空白檢查也套到 `:` 型，
-/// `./my dir/foo.py:42:hit`（macOS 上很常見）會從 M14 的「認領」退化成「不認領」——
-/// 等於為了修「策略自己關掉」而引進另一個「策略自己關掉」。
-///
-/// 已知限制兩則（都是落回 truncate 兜底、不會產出錯輸出）：檔名形如 `a-1-b.py` 會讓最早
-/// 標記落在檔名內；含空白路徑的 rg **context** 行被第 3 條擋下（該檔 match 行仍認領）。
-///
-/// parity：全程 ASCII byte 比對；`i` 落在 ASCII sep 上必為 char 邊界，`&line[..i]` 安全。
-/// Python 用 char index、此處用 byte index，各自定位到同一個邏輯位置（M20 HTML 的
-/// native-index 範式）→ 非 ASCII 路徑也逐字節一致。
-fn match_line_key(line: &str) -> Option<(LineKind, &str)> {
+/// parity：全程 ASCII byte 比對；`i` 落在 ASCII sep 上必為 char 邊界，`&line[..i]` 安全
+/// （UTF-8 continuation byte 落在 0x80–0xBF，永遠不等於 `:`/`-`/ASCII 數字）。Python 用
+/// char index、此處用 byte index，各自定位到同一個邏輯位置（M20 native-index 範式）。
+fn marker_paths(line: &str, sep: u8) -> Vec<&str> {
     let b = line.as_bytes();
     let n = b.len();
+    let mut out: Vec<&str> = Vec::new();
     let mut i = 0usize;
     while i < n {
-        let c = b[i];
-        if c == b':' || c == b'-' {
+        if b[i] == sep {
             let mut j = i + 1;
             while j < n && b[j].is_ascii_digit() {
                 j += 1;
             }
             if j > i + 1 && j < n && (b[j] == b':' || b[j] == b'-') {
                 let path = &line[..i];
-                if path.is_empty() || !path.contains('/') {
-                    return None;
+                if !path.is_empty() && path.contains('/') {
+                    out.push(path);
                 }
-                if c == b'-' && (path.contains(' ') || path.contains('\t')) {
-                    return None;
-                }
-                let kind = if c == b':' {
-                    LineKind::Match
-                } else {
-                    LineKind::Context
-                };
-                return Some((kind, path));
             }
         }
         i += 1;
     }
-    None
+    out
+}
+
+/// 單行的**命中行**判斷（`:` 型標記）。context 行要靠整段的檔名白名單，見 `classify_lines`。
+fn match_line_key(line: &str) -> Option<&str> {
+    marker_paths(line, b':').into_iter().next()
+}
+
+/// 兩趟分類：先認命中行建立檔名白名單，再用白名單認 context 行。
+///
+/// **為何是兩趟（review 回合的核心修正）**：原本「取行內最早的 `<sep>\d+<sep>` 標記」
+/// 在檔名含 `-數字-` 時整個垮掉 —— `./src/step-2-runner.py:42:hit` 的 `-2-` 比真標記
+/// `:42:` 更早，path 被切成 `./src/step`。傷害不是「這行判錯」而是**整段 SEARCH 自己
+/// 關掉**（命中行認不得 → 可丟數為 0 → 比率閘門不認領 → 落盲目截斷），正是 M24 要修的
+/// 那個病自己重演。這種檔名一點都不罕見：migration、step、part、版本號都是。
+///
+/// 白名單的作法：命中行的 `:` 型標記歧義小，先掃出所有命中行的 file_key；context 行再從
+/// 自己的 `-` 型候選裡挑**出現在白名單中**的那一個 —— 不是猜哪個候選才對，而是問「這個
+/// path 是某個命中行認過的檔案嗎」。
+///
+/// **這條白名單同時換掉了原本的空白黑名單**：舊防線「`-` 型的 path 不得含 ASCII 空白」
+/// 被 U+3000 全形空白直接繞過（而這個里程碑的主題正是 CJK 路徑）。與其列舉更多空白字元
+/// —— 那是開放集合 —— 不如換掉「列舉」這個作法本身。
+///
+/// HashMap 只做查找/插入、從不迭代 → 無雜湊順序依賴（parity）。
+///
+/// 已知限制（都落回 truncate 兜底或保守保留，不會產出錯輸出）：context 行的**內容**若含
+/// `:數字:` 會被當成命中行（保守保留，不誤丟）；Windows 反斜線路徑與 `rg --heading` 的
+/// 無路徑輸出不認領 —— 後兩者自 M14 起如此，非 M24 引入。
+fn classify_lines<'a>(lines: &[&'a str]) -> Vec<Option<(LineKind, &'a str)>> {
+    let mut known: HashMap<&str, ()> = HashMap::new();
+    let mut parsed: Vec<Option<(LineKind, &str)>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        match match_line_key(line) {
+            Some(key) => {
+                known.insert(key, ());
+                parsed.push(Some((LineKind::Match, key)));
+            }
+            None => parsed.push(None),
+        }
+    }
+
+    for (i, line) in lines.iter().enumerate() {
+        if parsed[i].is_some() {
+            continue;
+        }
+        for path in marker_paths(line, b'-') {
+            if known.contains_key(path) {
+                parsed[i] = Some((LineKind::Context, path));
+                break;
+            }
+        }
+    }
+    parsed
 }
 
 /// 保序逐行掃：每個 file_key 計數，超過 KEEP_PER_FILE 的**命中**標記為「丟」。
@@ -394,10 +425,15 @@ fn match_line_key(line: &str) -> Option<(LineKind, &str)> {
 /// rg 的排版下這正好把 `after` 歸前一個命中、`before` 歸後一個命中，於是保留的命中連同
 /// context 一起保、丟掉的一起丟（不留孤兒 context）。
 ///
-/// HashMap 只做查找/累加、從不迭代；歸屬用純索引數學（前向/後向各一趟）——
-/// 結果僅依輸入順序，無雜湊順序依賴（parity）。
+/// **前向/後向表是 per-key 的（review 回合修掉的一條 HIGH）**：原本只追一個「全域最近
+/// 命中」再事後篩同檔，於是**別的檔案的命中插在中間就把同檔命中擋掉了** —— 歸屬落到
+/// 「找不到 owner → 保留」，被丟的命中留下孤兒 context，違反本函式自己宣稱的不變量。
+/// 單次 `rg -C` 的輸出同檔連續、踩不到；但壓的是 agent 串接起來的 tool_result，多次
+/// 搜尋結果貼在一起是正常情境，而測試的產生器結構上從不產生交錯輸入。
+///
+/// HashMap 只做查找/插入、從不迭代；歸屬用純索引數學 → 無雜湊順序依賴（parity）。
 fn search_drop_flags(lines: &[&str]) -> Vec<bool> {
-    let parsed: Vec<Option<(LineKind, &str)>> = lines.iter().map(|l| match_line_key(l)).collect();
+    let parsed = classify_lines(lines);
     let n = lines.len();
 
     // 命中行的去留：每個 file_key 計數，超過上限即丟。
@@ -411,43 +447,47 @@ fn search_drop_flags(lines: &[&str]) -> Vec<bool> {
         }
     }
 
-    // 前向一趟：每個位置「最近的前一個命中」的 (index, key)。
-    let mut prev: Vec<Option<(usize, &str)>> = vec![None; n];
-    let mut last: Option<(usize, &str)> = None;
+    // 前向一趟：每個 context 位置「同一個 key 最近的前一個命中」的 index。
+    let mut prev: Vec<Option<usize>> = vec![None; n];
+    let mut last_by_key: HashMap<&str, usize> = HashMap::new();
     for (i, p) in parsed.iter().enumerate() {
-        prev[i] = last;
-        if let Some((LineKind::Match, key)) = p {
-            last = Some((i, key));
+        match p {
+            Some((LineKind::Context, key)) => prev[i] = last_by_key.get(key).copied(),
+            Some((LineKind::Match, key)) => {
+                last_by_key.insert(key, i);
+            }
+            None => {}
         }
     }
 
-    // 後向一趟：每個位置「最近的後一個命中」的 (index, key)。
-    let mut next: Vec<Option<(usize, &str)>> = vec![None; n];
-    let mut last: Option<(usize, &str)> = None;
+    // 後向一趟：每個 context 位置「同一個 key 最近的後一個命中」的 index。
+    let mut next: Vec<Option<usize>> = vec![None; n];
+    let mut last_by_key: HashMap<&str, usize> = HashMap::new();
     for i in (0..n).rev() {
-        next[i] = last;
-        if let Some((LineKind::Match, key)) = &parsed[i] {
-            last = Some((i, key));
+        match &parsed[i] {
+            Some((LineKind::Context, key)) => next[i] = last_by_key.get(key).copied(),
+            Some((LineKind::Match, key)) => {
+                last_by_key.insert(key, i);
+            }
+            None => {}
         }
     }
 
     // context 行歸屬：距離小者勝，平手取前者；無同檔命中則保留。
     for i in 0..n {
-        let Some((LineKind::Context, key)) = parsed[i] else {
+        if !matches!(parsed[i], Some((LineKind::Context, _))) {
             continue;
-        };
-        let before = prev[i].filter(|(_, k)| *k == key);
-        let after = next[i].filter(|(_, k)| *k == key);
-        let owner = match (before, after) {
-            (Some((bi, _)), Some((ai, _))) => {
+        }
+        let owner = match (prev[i], next[i]) {
+            (Some(bi), Some(ai)) => {
                 if i - bi <= ai - i {
                     bi
                 } else {
                     ai
                 }
             }
-            (Some((bi, _)), None) => bi,
-            (None, Some((ai, _))) => ai,
+            (Some(bi), None) => bi,
+            (None, Some(ai)) => ai,
             (None, None) => continue, // 找不到同檔命中 → 保留（保守）
         };
         flags[i] = flags[owner];
