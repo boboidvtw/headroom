@@ -693,11 +693,17 @@ the running proxy emits four observation lines and forwards bytes unchanged.
 現在 `forward()` 與 SSE 路徑都改用 `writeln!`，並實測 stderr reader 退場後連送 7 次
 請求 proxy 仍存活。
 
-**「屬效能而非正確性」的判斷被數據推翻。** 每個節點無條件 `format!` 一條 location，
-即使整份 body 零 findings：1 MiB 的深結構 body 要 114 ms / 166 MB，同位元組數的淺
-結構只要 1.6 ms / 4.3 MB。`MAX_SCAN_BYTES` 限的是**位元組**不是**衍生工作量**，這個
-洞正好從它底下鑽過去，而這條路徑跑在轉發之前、完全由 client 控制。改成可變的片段
-堆疊（push/pop），location 只在真的產生 finding 時才具體化。
+**「屬效能而非正確性」的判斷被推翻，但推翻它的那個數字後來被收回了。** 每個節點
+無條件 `format!` 一條 location（即使整份 body 零 findings），改成可變的片段堆疊
+（push/pop），location 只在真的產生 finding 時才具體化 —— 這個改動是對的，它消除了
+成本對結構深度的相依。
+
+但這裡有一件更該記下來的事：當時 reviewer 給的證據是「1 MiB 深結構 114 ms / 166 MB
+vs 同位元組數淺結構 1.6 ms / 4.3 MB」，**我沒有自己重跑就把它當成事實寫進程式碼註解
+與這份 README**。下一輪 reviewer 自己重測後收回了那個數字（4.55 ms vs 2.26 ms，
+2 倍不是 70 倍）。改動本身站得住，理由是設計上的；那個數字不是。
+**引用別人的量測前要自己重跑一次** —— 這與本專案記過的「不可重現的增益＝沒有增益」
+是同一條，只是這次搞錯的是我引用的方向。
 
 同輪一併修掉的還有：`truncated` 一號多用（「撞上限」與「body 太大沒掃」共用一個
 旗標，於是 proxy 會對沒掃過的 body 印出「已達 10 個相異位置的上限」—— 修掉第一層
