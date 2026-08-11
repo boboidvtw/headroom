@@ -35,6 +35,18 @@ pub const MAX_FINDINGS: usize = 10;
 /// UUID sample 只留前綴，足以定位而不構成可用的憑證。
 pub const UUID_SAMPLE_CHARS: usize = 8;
 
+/// 單一 location 片段（客戶的 key 名）的字元上限；見 Python 版的完整說明。
+/// 要點：location 是**客戶自己的 key 名**串起來的，祖先 key 完全不受 needle
+/// 約束 —— 用 email 或 token 當 map key 的 JSON 會整串進觀測線。處置是設界
+/// 而非消除，因為 location 是這筆 finding 唯一可行動的內容。
+pub const MAX_LOCATION_SEGMENT_CHARS: usize = 40;
+pub const MAX_LOCATION_CHARS: usize = 200;
+
+/// 走訪深度上限，與 serde_json 的 parse 上限對齊。`scan_request` 走 parser
+/// 就已受限，但 `detect_volatile_content` 是公開 API、收已建好的 `Value`
+/// —— 沒有這道守門時實測會 stack overflow 而 **abort（exit 134，連攔都攔不到）**。
+pub const MAX_DEPTH: usize = 127;
+
 /// 超過這個大小就整包放棄掃描。這條路徑跑在**轉發之前**，掃多久就是延遲
 /// 多久 —— 觀測是盡力而為的功能，不值得為一份 1 GB 的 body 佔住 worker。
 pub const MAX_SCAN_BYTES: usize = 1 << 20;
@@ -86,7 +98,12 @@ pub struct VolatileFinding {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VolatileScan {
     pub findings: Vec<VolatileFinding>,
+    /// 撞到 `MAX_FINDINGS`，還有更多相異位置沒列出。
     pub truncated: bool,
+    /// body 超過 `MAX_SCAN_BYTES`，**根本沒掃**。與 `truncated` 是兩件事 ——
+    /// 共用一個旗標會讓 proxy 對沒掃過的 body 印出「已達上限」這種事實錯誤
+    /// 的觀測線（修掉第一層歧義又長出第二層）。
+    pub skipped_too_large: bool,
 }
 
 // ─── 入口 ──────────────────────────────────────────────────────────────
@@ -100,7 +117,8 @@ pub fn scan_request(raw: &[u8]) -> VolatileScan {
     if raw.len() > MAX_SCAN_BYTES {
         return VolatileScan {
             findings: Vec::new(),
-            truncated: true,
+            truncated: false,
+            skipped_too_large: true,
         };
     }
     // serde_json 一次擋掉四類：非 UTF-8、NaN/Infinity、落單 surrogate、
@@ -127,7 +145,7 @@ pub fn detect_volatile_content(body: &Value) -> VolatileScan {
     let mut out = Accumulator::new();
 
     if let Some(system) = body.get("system") {
-        scan_content(system, "system", &mut out);
+        scan_content(system, &mut vec!["system".to_string()], &mut out, 1);
     }
 
     if let Some(Value::Array(messages)) = body.get("messages") {
@@ -143,7 +161,12 @@ pub fn detect_volatile_content(body: &Value) -> VolatileScan {
                 return out.finish();
             }
             if let Some(content) = message.get("content") {
-                scan_content(content, &format!("messages[{i}].content"), &mut out);
+                scan_content(
+                    content,
+                    &mut vec![format!("messages[{i}].content")],
+                    &mut out,
+                    1,
+                );
             }
         }
     }
@@ -154,10 +177,19 @@ pub fn detect_volatile_content(body: &Value) -> VolatileScan {
                 return out.finish();
             }
             if let Some(Value::String(description)) = tool.get("description") {
-                scan_string(description, &format!("tools[{i}].description"), &mut out);
+                scan_string(
+                    description,
+                    &[format!("tools[{i}].description")],
+                    &mut out,
+                );
             }
             if let Some(schema) = tool.get("input_schema") {
-                scan_value(schema, &format!("tools[{i}].input_schema"), &mut out);
+                scan_value(
+                    schema,
+                    &mut vec![format!("tools[{i}].input_schema")],
+                    &mut out,
+                    1,
+                );
             }
         }
     }
@@ -180,11 +212,12 @@ impl Accumulator {
         }
     }
 
-    fn add(&mut self, kind: VolatileKind, location: &str, sample: String) {
+    fn add(&mut self, kind: VolatileKind, path: &[String], sample: String) {
+        let location = render_location(path);
         if let Some(e) = self
             .entries
             .iter_mut()
-            .find(|(k, loc, _, _)| *k == kind && loc == location)
+            .find(|(k, loc, _, _)| *k == kind && *loc == location)
         {
             e.3 += 1;
             return;
@@ -193,7 +226,7 @@ impl Accumulator {
             self.truncated = true;
             return;
         }
-        self.entries.push((kind, location.to_string(), sample, 1));
+        self.entries.push((kind, location, sample, 1));
     }
 
     /// 撞上限後就停止走訪（別為了數重複而掃完整份 body）。
@@ -214,6 +247,7 @@ impl Accumulator {
                 })
                 .collect(),
             truncated: self.truncated,
+            skipped_too_large: false,
         }
     }
 }
@@ -222,38 +256,48 @@ impl Accumulator {
 
 /// content 位置：可能是字串、可能是 block 陣列、也可能是 object。
 /// 行為與 `scan_value` 等價；保留兩個名字只為與解答本 / Python 端的結構對齊。
-fn scan_content(value: &Value, location: &str, out: &mut Accumulator) {
+fn scan_content(value: &Value, path: &mut Vec<String>, out: &mut Accumulator, depth: usize) {
     if out.full() {
         return;
     }
     match value {
-        Value::String(s) => scan_string(s, location, out),
+        Value::String(s) => scan_string(s, path, out),
         Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
                 if out.full() {
                     return;
                 }
-                scan_value(item, &format!("{location}[{i}]"), out);
+                path.push(format!("[{i}]"));
+                scan_value(item, path, out, depth + 1);
+                path.pop();
             }
         }
-        Value::Object(_) => scan_value(value, location, out),
+        Value::Object(_) => scan_value(value, path, out, depth),
         _ => {}
     }
 }
 
 /// 唯一會檢查 **key 名稱** 的走訪器。
-fn scan_value(value: &Value, location: &str, out: &mut Accumulator) {
-    if out.full() {
+///
+/// `path` 是**可變的片段堆疊**，push/pop 而不是每個節點都串一條新字串。
+/// 初版對每個 key、每個陣列元素都無條件 `format!` 一條 location，即使整份
+/// body 一個 finding 都沒有 —— review 實測 1 MiB 零 findings 的深結構 body
+/// 要 114 ms / 166 MB，同位元組數的淺結構只要 1.6 ms / 4.3 MB。
+/// `MAX_SCAN_BYTES` 限的是位元組不是衍生工作量，那個洞正好從它底下鑽過去。
+fn scan_value(value: &Value, path: &mut Vec<String>, out: &mut Accumulator, depth: usize) {
+    if out.full() || depth > MAX_DEPTH {
         return;
     }
     match value {
-        Value::String(s) => scan_string(s, location, out),
+        Value::String(s) => scan_string(s, path, out),
         Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
                 if out.full() {
                     return;
                 }
-                scan_value(item, &format!("{location}[{i}]"), out);
+                path.push(format!("[{i}]"));
+                scan_value(item, path, out, depth + 1);
+                path.pop();
             }
         }
         Value::Object(map) => {
@@ -261,14 +305,12 @@ fn scan_value(value: &Value, location: &str, out: &mut Accumulator) {
                 if out.full() {
                     return;
                 }
+                path.push(format!(".{}", cap_segment(key)));
                 if is_id_named_key(key) && !is_value_empty(sub) {
-                    out.add(
-                        VolatileKind::IdField,
-                        &format!("{location}.{key}"),
-                        describe(sub),
-                    );
+                    out.add(VolatileKind::IdField, path, describe(sub));
                 }
-                scan_value(sub, &format!("{location}.{key}"), out);
+                scan_value(sub, path, out, depth + 1);
+                path.pop();
             }
         }
         _ => {}
@@ -276,7 +318,7 @@ fn scan_value(value: &Value, location: &str, out: &mut Accumulator) {
 }
 
 /// 在一段字串裡找時間戳與 UUID v4。同一段字串裡多次命中累加 count。
-fn scan_string(text: &str, location: &str, out: &mut Accumulator) {
+fn scan_string(text: &str, path: &[String], out: &mut Accumulator) {
     let bytes = text.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
@@ -288,7 +330,7 @@ fn scan_string(text: &str, location: &str, out: &mut Accumulator) {
         if i + ISO_LEN <= n && looks_like_iso8601(&bytes[i..i + ISO_LEN]) {
             out.add(
                 VolatileKind::Timestamp,
-                location,
+                path,
                 text[i..i + ISO_LEN].to_string(),
             );
             i += ISO_LEN;
@@ -297,7 +339,7 @@ fn scan_string(text: &str, location: &str, out: &mut Accumulator) {
         if i + UUID_LEN <= n && looks_like_uuid_v4(&bytes[i..i + UUID_LEN]) {
             out.add(
                 VolatileKind::Uuid,
-                location,
+                path,
                 format!("{}…", &text[i..i + UUID_SAMPLE_CHARS]),
             );
             i += UUID_LEN;
@@ -305,6 +347,34 @@ fn scan_string(text: &str, location: &str, out: &mut Accumulator) {
         }
         i += 1;
     }
+}
+
+// ─── location 設界 ────────────────────────────────────────────────────
+
+/// 限制單一 key 名的長度（以**字元**計，與 Python 的 `len(str)` 對齊）。
+///
+/// 副作用要知道：兩個只在第 41 字元之後才不同的 key 會被折成同一個 location，
+/// 於是被 `Accumulator` 併成一筆（count 累加）。刻意的取捨。
+fn cap_segment(key: &str) -> String {
+    if key.chars().count() <= MAX_LOCATION_SEGMENT_CHARS {
+        return key.to_string();
+    }
+    let head: String = key.chars().take(MAX_LOCATION_SEGMENT_CHARS).collect();
+    format!("{head}…")
+}
+
+/// 把片段堆疊串成 location，並限制總長。保頭也保尾 —— 頭部是 `system` /
+/// `tools[0]` 這類定位資訊，尾部是真正命中的欄位名，中段最不重要。
+fn render_location(path: &[String]) -> String {
+    let joined: String = path.concat();
+    let len = joined.chars().count();
+    if len <= MAX_LOCATION_CHARS {
+        return joined;
+    }
+    let keep = (MAX_LOCATION_CHARS - 1) / 2;
+    let head: String = joined.chars().take(keep).collect();
+    let tail: String = joined.chars().skip(len - keep).collect();
+    format!("{head}…{tail}")
 }
 
 // ─── pattern 判別（全部明寫位置，不用 regex）────────────────────────────

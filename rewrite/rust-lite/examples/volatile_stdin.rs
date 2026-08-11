@@ -33,4 +33,7 @@ fn main() {
     if scan.truncated {
         let _ = writeln!(out, "{}", json!({ "truncated": true }));
     }
+    if scan.skipped_too_large {
+        let _ = writeln!(out, "{}", json!({ "skipped": true }));
+    }
 }

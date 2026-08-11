@@ -68,6 +68,8 @@ for f in scan.findings:
     ))
 if scan.truncated:
     print(json.dumps({"truncated": True}, separators=(",", ":")))
+if scan.skipped_too_large:
+    print(json.dumps({"skipped": True}, separators=(",", ":")))
 '
 
 for fixture in "$FIXTURE_DIR"/*.json "$FIXTURE_DIR"/*.bin; do
@@ -114,6 +116,8 @@ ADV_DIR="$FIXTURE_DIR/volatile"
 # 不得出現在任何輸出裡的祕密（secret_id_field.bin 的值）—— id_field 規則
 # 是唯一會撈任意客戶值的，這條守它永遠不把值印出來。
 SECRET="REDACTEDSECRET"
+secret_fixtures=0
+nonempty_goldens=0
 
 for fixture in "$ADV_DIR"/*.bin; do
     [ -e "$fixture" ] || continue
@@ -138,10 +142,18 @@ for fixture in "$ADV_DIR"/*.bin; do
     ok=1
     cmp -s "$OUT_DIR/adv.$name.py" "$expected" || { echo "FAIL  $name — Python 與 golden 不符："; diff "$expected" "$OUT_DIR/adv.$name.py" || true; ok=0; }
     cmp -s "$OUT_DIR/adv.$name.rs" "$expected" || { echo "FAIL  $name — Rust 與 golden 不符："; diff "$expected" "$OUT_DIR/adv.$name.rs" || true; ok=0; }
-    if grep -qF "$SECRET" "$OUT_DIR/adv.$name.py" "$OUT_DIR/adv.$name.rs" 2>/dev/null; then
-        echo "FAIL  $name — 客戶祕密出現在 findings 輸出裡"
-        ok=0
+    # **先確認守門有東西可擋**：只斷言「輸出不含祕密」的話，祕密一旦從
+    # fixture 輸入裡消失（改個值、換個 key 名），grep 的 needle 就永遠不可能
+    # 命中，整條守門安靜空轉而全綠 —— review 二輪實測打穿過。
+    # 守門要同時測「該擋的擋了」與「真的有東西可擋」。
+    if grep -qF "$SECRET" "$fixture"; then
+        if grep -qF "$SECRET" "$OUT_DIR/adv.$name.py" "$OUT_DIR/adv.$name.rs" 2>/dev/null; then
+            echo "FAIL  $name — 客戶祕密出現在 findings 輸出裡"
+            ok=0
+        fi
+        secret_fixtures=$((secret_fixtures + 1))
     fi
+    [ -s "$expected" ] && nonempty_goldens=$((nonempty_goldens + 1))
     [ "$ok" -eq 1 ] && echo "PASS  $name" || fail=1
 done
 
@@ -149,8 +161,20 @@ done
 # 目錄被清空或 glob 沒配到，上面整個迴圈會一次都不跑而安靜通過。
 adv_count="$(find "$ADV_DIR" -name '*.bin' | wc -l | tr -d ' ')"
 EXPECTED_ADV_CASES=15
+EXPECTED_NONEMPTY_GOLDENS=9
+EXPECTED_SECRET_FIXTURES=1
 if [ "$adv_count" -ne "$EXPECTED_ADV_CASES" ]; then
     echo "FAIL  adversarial 案例數為 $adv_count，期望 $EXPECTED_ADV_CASES（新增案例請一併改這個數字）"
+    fail=1
+fi
+# 15 個 golden 裡有一半是空的（NaN / BOM / 超深巢狀的正確答案就是「兩邊都空」）。
+# 若非空 golden 歸零，整批就退化成「空對空」而什麼都沒驗到。
+if [ "$nonempty_goldens" -ne "$EXPECTED_NONEMPTY_GOLDENS" ]; then
+    echo "FAIL  非空 golden 數為 $nonempty_goldens，期望 $EXPECTED_NONEMPTY_GOLDENS"
+    fail=1
+fi
+if [ "$secret_fixtures" -ne "$EXPECTED_SECRET_FIXTURES" ]; then
+    echo "FAIL  含祕密的 fixture 數為 $secret_fixtures，期望 $EXPECTED_SECRET_FIXTURES —— 祕密外洩守門沒有東西可擋"
     fail=1
 fi
 

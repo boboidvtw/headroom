@@ -8,7 +8,10 @@
 //! `tests/fixtures/volatile/` 的 adversarial gate（parity.sh 相 3），
 //! 這裡放的是單語言就說得清楚的行為。
 
-use headroom_lite_rs::volatile::{scan_request, VolatileKind, MAX_FINDINGS, MAX_SCAN_BYTES};
+use headroom_lite_rs::volatile::{
+    detect_volatile_content, scan_request, VolatileKind, MAX_FINDINGS, MAX_LOCATION_CHARS,
+    MAX_LOCATION_SEGMENT_CHARS, MAX_SCAN_BYTES,
+};
 
 // ─── 1. timestamp ──────────────────────────────────────────────────────
 
@@ -224,12 +227,87 @@ fn repeated_hits_in_one_location_share_a_slot() {
 }
 
 #[test]
-fn oversized_body_is_skipped_with_signal() {
+fn oversized_body_is_skipped_with_its_own_signal() {
     // 這條路徑跑在轉發之前，掃多久就是延遲多久。
+    // **訊號不可與撞上限共用**：初版兩者共用 truncated，於是 proxy 會對一份
+    // 根本沒掃過的 body 印出「已達 10 個相異位置的上限」——事實錯誤的觀測線。
     let raw = format!(r#"{{"system":"{}"}}"#, "x".repeat(MAX_SCAN_BYTES + 1));
     let scan = scan_request(raw.as_bytes());
     assert!(scan.findings.is_empty());
-    assert!(scan.truncated, "放棄掃描必須留下訊號");
+    assert!(scan.skipped_too_large, "放棄掃描必須留下訊號");
+    assert!(
+        !scan.truncated,
+        "沒掃過的 body 不該宣稱『撞到 findings 上限』"
+    );
+}
+
+#[test]
+fn rejected_inputs_set_no_signal_at_all() {
+    // 拒收路徑不得誤設任何旗標，否則下游會把「看不懂」當成「還有更多」。
+    let nan = br#"{"system":"2026-05-04T14:30:00Z","x":NaN}"#;
+    for raw in [&b"not json"[..], &nan[..], &[0xff, 0xfe][..]] {
+        let scan = scan_request(raw);
+        assert!(scan.findings.is_empty());
+        assert!(!scan.truncated && !scan.skipped_too_large, "{raw:?}");
+    }
+}
+
+// ─── 4b. location 設界（review 二輪）──────────────────────────────────
+
+#[test]
+fn location_segment_is_capped() {
+    // location 是**客戶 key 名**串起來的路徑，祖先 key 完全不受 needle 約束
+    // —— 一份用 email 或 token 當 map key 的 JSON，整串都會進觀測線。
+    let long_key = "A".repeat(200);
+    let raw = format!(r#"{{"tools":[{{"input_schema":{{"{long_key}":{{"trace_id":"v"}}}}}}]}}"#);
+    let findings = scan_request(raw.as_bytes()).findings;
+    assert_eq!(
+        findings[0].location,
+        format!(
+            "tools[0].input_schema.{}….trace_id",
+            "A".repeat(MAX_LOCATION_SEGMENT_CHARS)
+        )
+    );
+}
+
+#[test]
+fn location_total_length_is_capped() {
+    // 沒有總長上限的話，200 KB 的 key 名就是 200 KB 的單行 stderr。
+    let mut nested = String::from(r#"{"trace_id":"v"}"#);
+    for i in 0..40 {
+        nested = format!(r#"{{"segment_{i}_{}":{nested}}}"#, "x".repeat(30));
+    }
+    let raw = format!(r#"{{"tools":[{{"input_schema":{nested}}}]}}"#);
+    let findings = scan_request(raw.as_bytes()).findings;
+    let loc = &findings[0].location;
+    assert!(
+        loc.chars().count() <= MAX_LOCATION_CHARS + 1,
+        "{}",
+        loc.chars().count()
+    );
+    assert!(loc.ends_with(".trace_id"), "尾端命中欄位必須保留：{loc}");
+    assert!(loc.starts_with("tools[0]"), "頭部定位資訊必須保留：{loc}");
+}
+
+#[test]
+fn deep_value_via_public_api_is_bounded_by_the_depth_guard() {
+    // `detect_volatile_content` 是公開 API、收已建好的 Value，繞過了
+    // serde_json parser 的深度上限 —— 所以走訪內要再擋一次。
+    //
+    // 誠實界線：這道守門讓**走訪**有界，但沒辦法讓任意深的 `Value` 變安全
+    // —— 實測 5000 層時連 serde_json 自己的遞迴 `Drop` 都會 stack overflow
+    // 並 abort，那發生在本模組之外、也在守門之外。這裡取一個 serde_json
+    // 撐得住、而守門確實會觸發的深度（1000 > MAX_DEPTH=127）。
+    let mut deep = serde_json::json!({"trace_id": "2026-05-04T14:30:00Z"});
+    for _ in 0..1000 {
+        deep = serde_json::json!({ "nest": deep });
+    }
+    let scan = detect_volatile_content(&serde_json::json!({ "system": deep }));
+    assert!(
+        scan.findings.is_empty(),
+        "超過 MAX_DEPTH 的部分不該被走訪：{:?}",
+        scan.findings
+    );
 }
 
 #[test]

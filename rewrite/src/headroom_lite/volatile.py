@@ -87,6 +87,16 @@ MAX_FINDINGS = 10
 #: UUID sample 只留前綴，足以定位而不構成可用的憑證。
 UUID_SAMPLE_CHARS = 8
 
+#: 單一 location 片段（客戶的 key 名）的字元上限。
+#: location 是**客戶自己的 key 名串起來的路徑**，祖先 key 完全不受 needle 約束
+#: —— 一份用 email 或 token 當 map key 的 JSON，整串都會進觀測線。sample 政策
+#: 用來否決「回吐值」的理由（needle 是子字串比對、命中集合是開放集合、不能假設
+#: 命中的東西不是祕密）對 key 名同樣成立。
+#: 但 location 是這筆 finding **唯一可行動的內容**，拿掉它等於拿掉整筆發現，
+#: 所以這裡的處置是**設界**而不是消除：限制單段與總長，同時擋住 log 體積 DoS。
+MAX_LOCATION_SEGMENT_CHARS = 40
+MAX_LOCATION_CHARS = 200
+
 #: 容器巢狀深度上限。**這個數字必須跟 Rust 對齊**：serde_json 的 parser
 #: 在第 128 層容器就回 Err（整份文件 → 空結果），Python 的 json 沒有這個
 #: 限制，於是 127–999 層會變成一整段無聲分岔帶（review 實測）。兩側各由
@@ -129,13 +139,19 @@ class VolatileFinding:
 class VolatileScan:
     """掃描結果。
 
-    truncated 為真代表「還有更多，我們放棄了」—— 沒有這個欄位的話，剛好
-    10 筆與撞上限長得一模一樣，而那正是本專案反覆吃虧的形狀（守門在最該
-    生效時安靜失效）。
+    truncated 為真代表「撞到 MAX_FINDINGS，還有更多沒列出」—— 沒有這個
+    欄位的話，剛好 10 筆與撞上限長得一模一樣，而那正是本專案反覆吃虧的形狀
+    （守門在最該生效時安靜失效）。
+
+    skipped_too_large 是**另一件事**：body 超過 MAX_SCAN_BYTES，根本沒掃。
+    初版把兩者共用 `truncated`，於是 proxy 會對一份沒掃過的 body 印出
+    「已達 10 個相異位置的上限」—— 修掉了第一層歧義，又在同一個欄位上長出
+    第二層。訊號要能分辨，就不能一號多用。
     """
 
     findings: list[VolatileFinding] = field(default_factory=list)
     truncated: bool = False
+    skipped_too_large: bool = False
 
     def __iter__(self):
         return iter(self.findings)
@@ -171,7 +187,7 @@ def scan_request(raw: bytes) -> VolatileScan:
       * 容器巢狀 > MAX_NESTING：對齊 serde_json 的 parse 深度上限。
     """
     if len(raw) > MAX_SCAN_BYTES:
-        return VolatileScan([], True)
+        return VolatileScan([], truncated=False, skipped_too_large=True)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -199,7 +215,7 @@ def detect_volatile_content(body: dict) -> VolatileScan:
 
     system = body.get("system")
     if system is not None:
-        _scan_content(system, "system", out)
+        _scan_content(system, ["system"], out, 1)
 
     messages = body.get("messages")
     if isinstance(messages, list):
@@ -215,7 +231,7 @@ def detect_volatile_content(body: dict) -> VolatileScan:
             if out.full:
                 return out.result()
             if isinstance(message, dict) and "content" in message:
-                _scan_content(message["content"], f"messages[{i}].content", out)
+                _scan_content(message["content"], [f"messages[{i}].content"], out, 1)
 
     tools = body.get("tools")
     if isinstance(tools, list):
@@ -226,9 +242,9 @@ def detect_volatile_content(body: dict) -> VolatileScan:
                 continue
             description = tool.get("description")
             if isinstance(description, str):
-                _scan_string(description, f"tools[{i}].description", out)
+                _scan_string(description, [f"tools[{i}].description"], out)
             if "input_schema" in tool:
-                _scan_value(tool["input_schema"], f"tools[{i}].input_schema", out)
+                _scan_value(tool["input_schema"], [f"tools[{i}].input_schema"], out, 1)
 
     return out.result()
 
@@ -246,7 +262,8 @@ class _Accumulator:
         self._samples: dict[tuple[str, str], str] = {}
         self.truncated = False
 
-    def add(self, kind: str, location: str, sample: str) -> None:
+    def add(self, kind: str, path: list[str], sample: str) -> None:
+        location = _render_location(path)
         key = (kind, location)
         if key in self._counts:
             self._counts[key] += 1
@@ -268,14 +285,14 @@ class _Accumulator:
                 VolatileFinding(kind=k, location=loc, sample=self._samples[(k, loc)], count=n)
                 for (k, loc), n in self._counts.items()
             ],
-            self.truncated,
+            truncated=self.truncated,
         )
 
 
 # ─── 走訪 ──────────────────────────────────────────────────────────────
 
 
-def _scan_content(value, location: str, out: _Accumulator) -> None:
+def _scan_content(value, path: list[str], out: _Accumulator, depth: int) -> None:
     """content 位置：可能是字串、可能是 block 陣列、也可能是 object。
 
     行為與 `_scan_value` 等價（前者的 object 分支直接委派後者）；保留兩個
@@ -285,44 +302,57 @@ def _scan_content(value, location: str, out: _Accumulator) -> None:
     if out.full:
         return
     if isinstance(value, str):
-        _scan_string(value, location, out)
+        _scan_string(value, path, out)
     elif isinstance(value, list):
         for i, item in enumerate(value):
             if out.full:
                 return
-            _scan_value(item, f"{location}[{i}]", out)
+            path.append(f"[{i}]")
+            _scan_value(item, path, out, depth + 1)
+            path.pop()
     elif isinstance(value, dict):
-        _scan_value(value, location, out)
+        _scan_value(value, path, out, depth)
 
 
-def _scan_value(value, location: str, out: _Accumulator) -> None:
+def _scan_value(value, path: list[str], out: _Accumulator, depth: int) -> None:
     """唯一會檢查 **key 名稱** 的走訪器：tool input_schema、巢狀 block
     都流經這裡。
 
-    遞迴深度由 `scan_request` 的 MAX_NESTING 前置檢查擋住 —— 那個檢查是
-    迭代實作的，正是為了不用遞迴去防遞迴。（初版沒有它，depth 1000 的
-    body 會讓這裡拋 RecursionError，直接違反「絕不拋例外」的契約；而
-    `except (ValueError, ...)` 也接不住，RecursionError 不是 ValueError。）
+    `path` 是**可變的片段堆疊**，push/pop 而不是每個節點都串一條新字串。
+    初版對每個 key、每個陣列元素都無條件 `format!` 一條 location，即使整份
+    body 一個 finding 都沒有 —— review 實測 1 MiB 零 findings 的深結構
+    body 要 114 ms / 166 MB，而同位元組數的淺結構只要 1.6 ms / 4.3 MB。
+    `MAX_SCAN_BYTES` 限的是位元組不是衍生工作量，那個洞正好從它底下鑽過去。
+    location 現在只在**真的產生 finding 時**才具體化。
+
+    depth 守門：`scan_request` 已在文件層擋掉過深的輸入，但
+    `detect_volatile_content` 是公開 API、可以直接收手工建的結構 ——
+    Rust 那側在這種情況會 stack overflow 而 **abort（連攔都攔不到）**，
+    所以兩邊都在走訪內再擋一次。對通過文件層檢查的輸入永不觸發。
     """
-    if out.full:
+    if out.full or depth > MAX_NESTING:
         return
     if isinstance(value, str):
-        _scan_string(value, location, out)
+        _scan_string(value, path, out)
     elif isinstance(value, list):
         for i, item in enumerate(value):
             if out.full:
                 return
-            _scan_value(item, f"{location}[{i}]", out)
+            path.append(f"[{i}]")
+            _scan_value(item, path, out, depth + 1)
+            path.pop()
     elif isinstance(value, dict):
         for key, sub in value.items():
             if out.full:
                 return
+            path.append("." + _cap_segment(key))
             if _is_id_named_key(key) and not _is_value_empty(sub):
-                out.add(ID_FIELD, f"{location}.{key}", _describe(sub))
-            _scan_value(sub, f"{location}.{key}", out)
+                out.add(ID_FIELD, path, _describe(sub))
+            _scan_value(sub, path, out, depth + 1)
+            path.pop()
 
 
-def _scan_string(text: str, location: str, out: _Accumulator) -> None:
+def _scan_string(text: str, path: list[str], out: _Accumulator) -> None:
     """在一段字串裡找時間戳與 UUID v4。同一段字串裡多次命中累加 count。
 
     這裡逐 **code point** 掃，Rust 端逐 **byte** 掃 —— 兩邊的索引不同，
@@ -337,14 +367,42 @@ def _scan_string(text: str, location: str, out: _Accumulator) -> None:
             return
         # 先試 ISO-8601：視窗較短，字串剛好在 UUID 中間結束時比較不會漏。
         if i + _ISO_LEN <= n and _looks_like_iso8601(text, i):
-            out.add(TIMESTAMP, location, text[i : i + _ISO_LEN])
+            out.add(TIMESTAMP, path, text[i : i + _ISO_LEN])
             i += _ISO_LEN
             continue
         if i + _UUID_LEN <= n and _looks_like_uuid_v4(text, i):
-            out.add(UUID_V4, location, text[i : i + UUID_SAMPLE_CHARS] + "…")
+            out.add(UUID_V4, path, text[i : i + UUID_SAMPLE_CHARS] + "…")
             i += _UUID_LEN
             continue
         i += 1
+
+
+# ─── location 設界 ────────────────────────────────────────────────────
+
+
+def _cap_segment(key: str) -> str:
+    """限制單一 key 名的長度。
+
+    副作用要知道：兩個只在第 41 字元之後才不同的 key 會被折成同一個
+    location，於是被 `_Accumulator` 併成一筆（count 累加）。這是刻意的
+    取捨 —— 觀測線的可讀性與長度上限，優先於區分兩個 40 字元前綴相同的 key。
+    """
+    if len(key) <= MAX_LOCATION_SEGMENT_CHARS:
+        return key
+    return key[:MAX_LOCATION_SEGMENT_CHARS] + "…"
+
+
+def _render_location(path: list[str]) -> str:
+    """把片段堆疊串成 location，並限制總長。
+
+    保頭也保尾：頭部是 `system` / `tools[0]` 這類定位資訊，尾部是真正命中
+    的欄位名 —— 兩端都比中間有用，所以中段省略。
+    """
+    joined = "".join(path)
+    if len(joined) <= MAX_LOCATION_CHARS:
+        return joined
+    keep = (MAX_LOCATION_CHARS - 1) // 2
+    return joined[:keep] + "…" + joined[-keep:]
 
 
 # ─── pattern 判別（全部明寫位置，不用 regex）────────────────────────────

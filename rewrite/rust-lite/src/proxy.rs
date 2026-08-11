@@ -124,7 +124,7 @@ fn json_response(status: StatusCode, value: &Value) -> Response {
 /// 一筆就是一行，不會被內容打穿而錯亂 log。sample 依政策永不含客戶的值。
 fn emit_volatile_observations(raw: &[u8]) {
     let scan = crate::volatile::scan_request(raw);
-    if scan.findings.is_empty() && !scan.truncated {
+    if scan.findings.is_empty() && !scan.truncated && !scan.skipped_too_large {
         return;
     }
     let stderr = std::io::stderr();
@@ -146,6 +146,15 @@ fn emit_volatile_observations(raw: &[u8]) {
             out,
             "  [volatile] 還有更多未列出（已達 {} 個相異位置的上限）",
             crate::volatile::MAX_FINDINGS,
+        );
+    }
+    if scan.skipped_too_large {
+        // 這與「撞上限」是兩件事。初版共用 truncated，於是一份根本沒掃過的
+        // body 會被印成「已達 10 個相異位置的上限」—— 事實錯誤的觀測線。
+        let _ = writeln!(
+            out,
+            "  [volatile] body 超過 {} bytes，整包略過未掃",
+            crate::volatile::MAX_SCAN_BYTES,
         );
     }
 }
@@ -188,7 +197,13 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: Request) -> Response
     let url = format!("{}{}", state.upstream, path_and_query);
 
     // 觀測線（stderr）：in == out 代表 pipeline 全程 Borrowed（原 bytes 本人）
-    eprintln!(
+    //
+    // `writeln!` 而非 `eprintln!` —— 後者在 stderr 寫入失敗時 panic。
+    // 這一行**每個請求都跑**（含 GET），觸發面比下面那條 volatile 觀測線更廣，
+    // 所以只加固 volatile 那條等於沒加固：`proxy 2>&1 | head` 照樣炸，
+    // 只是把 panic 往後挪了幾行。（review 二輪實測 exit=101。）
+    let _ = writeln!(
+        std::io::stderr(),
         "{} {} in={}B out={}B{}",
         parts.method,
         path_and_query,
@@ -456,7 +471,11 @@ where
                 Some(Ok(chunk)) => {
                     // 被動觀察：偵測到 ccr_retrieve 只記觀測線、不改 bytes。
                     for key in st.probe.feed(&chunk) {
-                        eprintln!("  [sse] model called ccr_retrieve key={key} (observed, passthrough)");
+                        // 同上：串流路徑的觀測線也不得因 stderr EPIPE 而 panic。
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  [sse] model called ccr_retrieve key={key} (observed, passthrough)"
+                        );
                     }
                     for frame in st.splitter.feed_frames(&chunk) {
                         st.queue.push_back(Bytes::from(frame));

@@ -15,6 +15,8 @@ import json
 from headroom_lite.volatile import (
     ID_FIELD,
     MAX_FINDINGS,
+    MAX_LOCATION_CHARS,
+    MAX_LOCATION_SEGMENT_CHARS,
     MAX_NESTING,
     MAX_SCAN_BYTES,
     TIMESTAMP,
@@ -324,12 +326,65 @@ def test_deep_nesting_does_not_raise():
     assert scan_request(deep).findings == []
 
 
-def test_oversized_body_is_skipped_with_signal():
-    """觀測是盡力而為的功能。這條路徑跑在轉發之前，掃多久就是延遲多久。"""
+def test_oversized_body_is_skipped_with_its_own_signal():
+    """觀測是盡力而為的功能。這條路徑跑在轉發之前，掃多久就是延遲多久。
+
+    **訊號不可與撞上限共用**：初版兩者共用 `truncated`，於是 proxy 會對一份
+    根本沒掃過的 body 印出「已達 10 個相異位置的上限」—— 修掉了第一層歧義，
+    又在同一個欄位上長出第二層。
+    """
     huge = b'{"system":"' + b"x" * (MAX_SCAN_BYTES + 1) + b'"}'
     scan = scan_request(huge)
     assert scan.findings == []
-    assert scan.truncated, "放棄掃描必須留下訊號，不能與『乾淨的 body』長得一樣"
+    assert scan.skipped_too_large, "放棄掃描必須留下訊號"
+    assert not scan.truncated, "沒掃過的 body 不該宣稱『撞到 findings 上限』"
+
+
+def test_rejected_inputs_set_no_signal_at_all():
+    """拒收路徑不得誤設任何旗標 —— 否則下游會把『看不懂』當成『還有更多』。"""
+    for raw in (b"not json", b'{"system":"2026-05-04T14:30:00Z","x":NaN}', b"\xff\xfe"):
+        scan = scan_request(raw)
+        assert scan.findings == []
+        assert not scan.truncated and not scan.skipped_too_large, raw
+
+
+# ─── 4c. location 設界（review 二輪）──────────────────────────────────
+
+
+def test_location_segment_is_capped():
+    """location 是**客戶 key 名**串起來的路徑，祖先 key 完全不受 needle 約束。
+    一份用 email 或 token 當 map key 的 JSON，整串都會進觀測線。"""
+    long_key = "A" * 200
+    findings = scan_request(
+        _body({"tools": [{"input_schema": {long_key: {"trace_id": "v"}}}]})
+    )
+    assert findings[0].location == (
+        f"tools[0].input_schema.{'A' * MAX_LOCATION_SEGMENT_CHARS}….trace_id"
+    )
+
+
+def test_location_total_length_is_capped():
+    """沒有總長上限的話，200 KB 的 key 名就是 200 KB 的單行 stderr。"""
+    nested = {"trace_id": "v"}
+    for i in range(40):
+        nested = {f"segment_{i}_{'x' * 30}": nested}
+    findings = scan_request(_body({"tools": [{"input_schema": nested}]}))
+    assert len(findings[0].location) <= MAX_LOCATION_CHARS + 1  # +1 為省略號
+    assert findings[0].location.endswith(".trace_id"), "尾端命中欄位必須保留"
+    assert findings[0].location.startswith("tools[0]"), "頭部定位資訊必須保留"
+
+
+def test_deep_value_via_public_api_does_not_blow_up():
+    """`detect_volatile_content` 是公開 API、可直接收手工建的結構。
+    Rust 那側在這種情況會 stack overflow 而 **abort**（連攔都攔不到），
+    所以兩邊都在走訪內再擋一次深度。"""
+    from headroom_lite.volatile import detect_volatile_content
+
+    deep = {"trace_id": "2026-05-04T14:30:00Z"}
+    for _ in range(5000):
+        deep = {"nest": deep}
+    scan = detect_volatile_content({"system": deep})
+    assert scan.findings == []
 
 
 def test_scan_does_not_mutate_input_bytes():
