@@ -263,7 +263,14 @@ class _Accumulator:
         self.truncated = False
 
     def add(self, kind: str, path: list[str], sample: str) -> None:
-        location = _render_location(path)
+        self.add_rendered(kind, _render_location(path), sample)
+
+    def add_rendered(self, kind: str, location: str, sample: str) -> None:
+        """location 已經算好時走這條 —— `_scan_string` 對同一段字串裡的每一次
+        命中都會呼叫，而重複命中**不受 MAX_FINDINGS 約束**（命中既有 entry
+        就提早 return，`full` 永遠不為真），所以每命中一次就重算一次路徑會讓
+        成本隨「命中數 × 路徑長」成長。這正是 module 文件自己點名過的用例
+        （「同一段 log 裡的 40 個時間戳只佔一個名額」）。"""
         key = (kind, location)
         if key in self._counts:
             self._counts[key] += 1
@@ -320,10 +327,15 @@ def _scan_value(value, path: list[str], out: _Accumulator, depth: int) -> None:
 
     `path` 是**可變的片段堆疊**，push/pop 而不是每個節點都串一條新字串。
     初版對每個 key、每個陣列元素都無條件 `format!` 一條 location，即使整份
-    body 一個 finding 都沒有 —— review 實測 1 MiB 零 findings 的深結構
-    body 要 114 ms / 166 MB，而同位元組數的淺結構只要 1.6 ms / 4.3 MB。
-    `MAX_SCAN_BYTES` 限的是位元組不是衍生工作量，那個洞正好從它底下鑽過去。
-    location 現在只在**真的產生 finding 時**才具體化。
+    body 一個 finding 都沒有。
+
+    [WARNING] 這段註解原本寫著「review 實測 1 MiB 零 findings 的深結構 body
+    要 114 ms / 166 MB，同位元組數的淺結構只要 1.6 ms / 4.3 MB」——
+    **那個數字是 reviewer 給的，我沒有自己量過就當成事實寫進來，而它在下一輪
+    被 reviewer 自己收回了**（重測是 4.55 ms vs 2.26 ms，2 倍不是 70 倍）。
+    改用堆疊仍然是對的（消除了成本對深度的相依），但理由是設計上的，不是那個
+    數字。**引用別人的量測前要自己重跑一次** —— 這與本專案反覆記過的
+    「不可重現的增益＝沒有增益」是同一條。
 
     depth 守門：`scan_request` 已在文件層擋掉過深的輸入，但
     `detect_volatile_content` 是公開 API、可以直接收手工建的結構 ——
@@ -362,16 +374,22 @@ def _scan_string(text: str, path: list[str], out: _Accumulator) -> None:
     """
     n = len(text)
     i = 0
+    # 一段字串共用一條 location，只在第一次命中時才算（見 add_rendered）。
+    location: str | None = None
     while i < n:
         if out.full:
             return
         # 先試 ISO-8601：視窗較短，字串剛好在 UUID 中間結束時比較不會漏。
         if i + _ISO_LEN <= n and _looks_like_iso8601(text, i):
-            out.add(TIMESTAMP, path, text[i : i + _ISO_LEN])
+            if location is None:
+                location = _render_location(path)
+            out.add_rendered(TIMESTAMP, location, text[i : i + _ISO_LEN])
             i += _ISO_LEN
             continue
         if i + _UUID_LEN <= n and _looks_like_uuid_v4(text, i):
-            out.add(UUID_V4, path, text[i : i + UUID_SAMPLE_CHARS] + "…")
+            if location is None:
+                location = _render_location(path)
+            out.add_rendered(UUID_V4, location, text[i : i + UUID_SAMPLE_CHARS] + "…")
             i += _UUID_LEN
             continue
         i += 1

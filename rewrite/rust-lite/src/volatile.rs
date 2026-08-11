@@ -40,7 +40,13 @@ pub const UUID_SAMPLE_CHARS: usize = 8;
 /// 約束 —— 用 email 或 token 當 map key 的 JSON 會整串進觀測線。處置是設界
 /// 而非消除，因為 location 是這筆 finding 唯一可行動的內容。
 pub const MAX_LOCATION_SEGMENT_CHARS: usize = 40;
+
+/// 整條 location 的字元上限（超過則中段省略、保頭保尾）。
 pub const MAX_LOCATION_CHARS: usize = 200;
+const _: () = assert!(
+    MAX_LOCATION_CHARS >= 2,
+    "render_location 的 (N-1)/2 會 underflow"
+);
 
 /// 走訪深度上限，與 serde_json 的 parse 上限對齊。`scan_request` 走 parser
 /// 就已受限，但 `detect_volatile_content` 是公開 API、收已建好的 `Value`
@@ -138,8 +144,11 @@ pub fn scan_request(raw: &[u8]) -> VolatileScan {
 /// （crate 開了 `preserve_order`）—— 兩邊撞到上限時砍掉的是同一批。
 ///
 /// 注意：這是公開 API 且收**已建好的** `Value`，繞過了 `scan_request` 對
-/// serde_json parse 深度上限的依賴。呼叫端若程式化建出極深的 `Value`，
-/// 下面的遞迴會爆 stack —— 走 `scan_request` 就沒有這個問題。
+/// serde_json parse 深度上限的依賴 —— 所以走訪內另有 `MAX_DEPTH` 守門。
+/// 誠實界線：守門讓**走訪**有界，但救不了 `Value` 本身 —— 夠深的 `Value`
+/// 光是被 drop 就會讓 serde_json 自己的遞迴 `Drop` 爆 stack 並 abort，
+/// 那發生在本模組之外。門檻隨當下的 stack 大小而異（實測 libtest 的
+/// worker thread 上約 2000 層就 abort，8 MiB 的 main thread 撐得到 5000）。
 #[must_use]
 pub fn detect_volatile_content(body: &Value) -> VolatileScan {
     let mut out = Accumulator::new();
@@ -177,11 +186,7 @@ pub fn detect_volatile_content(body: &Value) -> VolatileScan {
                 return out.finish();
             }
             if let Some(Value::String(description)) = tool.get("description") {
-                scan_string(
-                    description,
-                    &[format!("tools[{i}].description")],
-                    &mut out,
-                );
+                scan_string(description, &[format!("tools[{i}].description")], &mut out);
             }
             if let Some(schema) = tool.get("input_schema") {
                 scan_value(
@@ -213,7 +218,15 @@ impl Accumulator {
     }
 
     fn add(&mut self, kind: VolatileKind, path: &[String], sample: String) {
-        let location = render_location(path);
+        self.add_rendered(kind, render_location(path), sample);
+    }
+
+    /// location 已經算好時走這條 —— `scan_string` 對同一段字串裡的每一次命中
+    /// 都會呼叫，而重複命中**不受 `MAX_FINDINGS` 約束**（命中既有 entry 就
+    /// 提早 return，`full()` 永遠不為真），所以每命中一次就重算一次路徑會讓
+    /// 成本隨「命中數 × 路徑長」成長。這正是 `MAX_FINDINGS` 的註解自己點名過
+    /// 的用例（「同一段 log 裡的 40 個時間戳只佔一個名額」）。
+    fn add_rendered(&mut self, kind: VolatileKind, location: String, sample: String) {
         if let Some(e) = self
             .entries
             .iter_mut()
@@ -281,9 +294,14 @@ fn scan_content(value: &Value, path: &mut Vec<String>, out: &mut Accumulator, de
 ///
 /// `path` 是**可變的片段堆疊**，push/pop 而不是每個節點都串一條新字串。
 /// 初版對每個 key、每個陣列元素都無條件 `format!` 一條 location，即使整份
-/// body 一個 finding 都沒有 —— review 實測 1 MiB 零 findings 的深結構 body
-/// 要 114 ms / 166 MB，同位元組數的淺結構只要 1.6 ms / 4.3 MB。
-/// `MAX_SCAN_BYTES` 限的是位元組不是衍生工作量，那個洞正好從它底下鑽過去。
+/// body 一個 finding 都沒有。
+///
+/// [WARNING] 這段註解原本寫著「review 實測 1 MiB 零 findings 的深結構 body
+/// 要 114 ms / 166 MB，同位元組數的淺結構只要 1.6 ms / 4.3 MB」——
+/// **那個數字是 reviewer 給的，我沒有自己量過就當成事實寫進來，而它在下一輪
+/// 被 reviewer 自己收回了**（重測 4.55 ms vs 2.26 ms，2 倍不是 70 倍）。
+/// 改用堆疊仍然是對的（消除了成本對深度的相依），但理由是設計上的，不是
+/// 那個數字。引用別人的量測前要自己重跑一次。
 fn scan_value(value: &Value, path: &mut Vec<String>, out: &mut Accumulator, depth: usize) {
     if out.full() || depth > MAX_DEPTH {
         return;
@@ -322,24 +340,28 @@ fn scan_string(text: &str, path: &[String], out: &mut Accumulator) {
     let bytes = text.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
+    // 一段字串共用一條 location，只在第一次命中時才算（見 add_rendered）。
+    let mut location: Option<String> = None;
     while i < n {
         if out.full() {
             return;
         }
         // 先試 ISO-8601：視窗較短，字串剛好在 UUID 中間結束時比較不會漏。
         if i + ISO_LEN <= n && looks_like_iso8601(&bytes[i..i + ISO_LEN]) {
-            out.add(
+            let loc = location.get_or_insert_with(|| render_location(path));
+            out.add_rendered(
                 VolatileKind::Timestamp,
-                path,
+                loc.clone(),
                 text[i..i + ISO_LEN].to_string(),
             );
             i += ISO_LEN;
             continue;
         }
         if i + UUID_LEN <= n && looks_like_uuid_v4(&bytes[i..i + UUID_LEN]) {
-            out.add(
+            let loc = location.get_or_insert_with(|| render_location(path));
+            out.add_rendered(
                 VolatileKind::Uuid,
-                path,
+                loc.clone(),
                 format!("{}…", &text[i..i + UUID_SAMPLE_CHARS]),
             );
             i += UUID_LEN;

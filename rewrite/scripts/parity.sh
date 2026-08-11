@@ -178,6 +178,42 @@ if [ "$secret_fixtures" -ne "$EXPECTED_SECRET_FIXTURES" ]; then
     fail=1
 fi
 
+# **形狀斷言**：id_field 的 sample 必須落在一個封閉集合裡。
+#
+# 上面那條 SECRET grep 是黑名單 —— 它只擋「我想得到的那一個字面值」，而且
+# review 兩次都打穿它（第一次是 needle 從輸入消失、第二次是把祕密挪到別的
+# key 上）。列舉會外洩的東西是開放集合，列舉**允許的形狀**才是封閉的。
+# 這條活在 gate 裡，重產 goldens 動不到它。
+uv run python - "$OUT_DIR" <<'PYSHAPE' || fail=1
+import json, pathlib, re, sys
+ALLOWED = re.compile(r"^(string\[\d+\]|number|bool|array\[\d+\]|object\[\d+\]|null)$")
+bad, checked = [], 0
+for f in pathlib.Path(sys.argv[1]).glob("*"):
+    if not f.is_file():
+        continue
+    for line in f.read_text(errors="replace").splitlines():
+        if '"id_field"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("kind") != "id_field":
+            continue
+        checked += 1
+        if not ALLOWED.match(rec.get("sample", "")):
+            bad.append((f.name, rec["sample"]))
+if bad:
+    print("FAIL  id_field sample 形狀不合法（sample 政策：永不回吐客戶的值）：")
+    for name, sample in bad[:10]:
+        print(f"        {name}: {sample!r}")
+    raise SystemExit(1)
+if checked == 0:
+    print("FAIL  沒有任何 id_field sample 被檢查 —— 形狀斷言空轉")
+    raise SystemExit(1)
+print(f"PASS  id_field sample 形狀（檢查 {checked} 筆）")
+PYSHAPE
+
 if [ "$fail" -ne 0 ]; then
     echo "volatile adversarial gate: FAIL"
     exit 1

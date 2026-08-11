@@ -295,11 +295,17 @@ fn deep_value_via_public_api_is_bounded_by_the_depth_guard() {
     // serde_json parser 的深度上限 —— 所以走訪內要再擋一次。
     //
     // 誠實界線：這道守門讓**走訪**有界，但沒辦法讓任意深的 `Value` 變安全
-    // —— 實測 5000 層時連 serde_json 自己的遞迴 `Drop` 都會 stack overflow
-    // 並 abort，那發生在本模組之外、也在守門之外。這裡取一個 serde_json
-    // 撐得住、而守門確實會觸發的深度（1000 > MAX_DEPTH=127）。
+    // —— 夠深的 `Value` 光是被 drop 就會讓 serde_json 自己的遞迴 `Drop`
+    // stack overflow 並 abort（SIGABRT，直接殺掉整個 test binary，不是測試
+    // 失敗），那發生在本模組之外、也在守門之外。
+    //
+    // **門檻隨當下的 stack 大小而異**：libtest 的 worker thread 上約 2000 層
+    // 就 abort，8 MiB 的 main thread 撐得到 5000。所以這裡取 300 —— 仍是
+    // MAX_DEPTH(127) 的 2.4 倍、守門確實會觸發，而離 abort 門檻夠遠。
+    // （初版寫 1000 並在註解裡說「5000 才會 abort」，那個 5000 是量測當下那個
+    //   stack 的產物、不是門檻，會讓讀者以為安全邊際比實際大。）
     let mut deep = serde_json::json!({"trace_id": "2026-05-04T14:30:00Z"});
-    for _ in 0..1000 {
+    for _ in 0..300 {
         deep = serde_json::json!({ "nest": deep });
     }
     let scan = detect_volatile_content(&serde_json::json!({ "system": deep }));
