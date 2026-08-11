@@ -862,21 +862,97 @@ Verification worth recording, because passing gates is not the same as gating:
   applied — byte-identical.
 - The new `18_rg_context.json` was checked to genuinely exercise the new path: before M24 it
   falls to TRUNCATE, after it routes to SEARCH. Surviving files go **2/4 → 4/4** while the
-  output *grows* 3042 → 3507 bytes — a deliberate trade of compression ratio for the signal
-  the strategy exists to preserve (which files the hits are in), the same trade M22 made.
+  output *grows* **3289 → 3845 bytes** — a deliberate trade of compression ratio for the
+  signal the strategy exists to preserve (which files the hits are in), the same trade M22
+  made. *(These byte counts were wrong in the first version of this section — see the review
+  round below.)*
 - The fixture deliberately mixes ASCII and CJK paths (`./源碼/引擎/派發.py`), because the
   module comments claim the Python-char-index / Rust-byte-index pair stays byte-identical on
   non-ASCII input (the M20 native-index pattern) — **that claim previously had no gate.**
 - The whitespace guard was verified in both directions: removing it makes the
   log-line-with-a-path test fail, and its presence does not affect the `:`-type path.
 
-Known limitations, both falling back to truncate rather than producing wrong output: a
-filename shaped like `a-1-b.py` puts the earliest marker inside the filename (the industrial
-version shares this property); and rg **context** lines under a path containing whitespace are
-not claimed, though that file's match lines still are.
-
-Gates: Python 204 → **214**, Rust 195 → **201**, parity **18** fixtures × two phases + 15
+Gates: Python 204 → **221**, Rust 195 → **206**, parity **18** fixtures × two phases + 15
 adversarial cases + the id_field shape assertion, clippy 0.
+
+### The review round: three reviewers, seven findings, all seven held up
+
+Three reviewers (Python, Rust, general) audited M24 after it was pushed. **Every accusation
+was independently reproduced before being accepted, and every one of them was real.** The
+most important is that the first version of this milestone *reproduced the very bug it was
+written to fix*.
+
+**[CRITICAL] The "take the earliest marker" rule re-created the self-disabling gate.** A
+filename shaped like `step-2-runner.py` puts a valid marker (`-2-`) to the left of the real
+one (`:42:`), so the path was cut to `./src/step`. The first version of this section
+dismissed that as a rare-filename limitation that "falls back to truncate rather than
+producing wrong output" — **both halves of that sentence were wrong**. Filenames of that
+shape are ordinary (migrations, `step-N-`, `part-N-of-M`, version numbers), and the damage is
+not confined to the offending line: with the match lines unrecognised, the droppable count
+falls to zero, the ratio gate declines the whole block, and *every* file in the result loses
+its per-file distribution — the identical failure mode M24 exists to eliminate.
+
+The fix replaces "guess which marker is the real one" with **two passes and a filename
+allowlist**: pass one recognises match lines (`:`-type markers, which are far less ambiguous),
+collecting their file keys; pass two accepts a `-`-type candidate only if its path is one of
+those keys. So `-2-` (→ `./src/step`) is rejected and `-41-` (→ `./src/step-2-runner.py`) is
+accepted — the question is no longer *which candidate looks right* but *is this path a file
+some match line already vouched for*.
+
+That allowlist also **retired the whitespace blacklist**. The guard added earlier in this same
+milestone ("a `-`-type path must not contain whitespace") was walked straight through by
+U+3000, the ideographic space — in a milestone whose headline feature is CJK path support.
+The lesson is not "enumerate more whitespace characters": that set is open-ended. It is to
+**replace enumeration with an allowlist**, which is what pass two does.
+
+**[HIGH] Giving up on the first failed candidate.** `2026-06-20 ./src/foo.py:42:hit` was
+unrecognised entirely — the `-06-` candidate failed the `/` check and the scanner returned
+instead of continuing rightward to the genuine `:42:`. M14 recognised this line; M24 had
+regressed it. The scanner now collects every candidate rather than committing to the first.
+
+**[HIGH] Context attribution tracked the globally nearest match, not the nearest same-file
+match** — despite the docstring claiming the latter. A match belonging to another file, sitting
+between a context line and its true owner, hid the owner; attribution fell through to
+"no owner → keep", leaving exactly the orphan context the invariant forbids. A single `rg -C`
+run keeps one file's lines together so it never triggers, but headroom compresses tool_results
+assembled by an agent, where several searches pasted together is ordinary — and both languages'
+test generators only ever emitted per-file-contiguous input. The forward/backward tables are
+now per-key.
+
+**[HIGH] The tie-break rule had no test at all.** "Ties go to the earlier match" is stated in
+three places as a deliberate decision, yet no fixture ever produced two matches equidistant
+from a context line: flipping `<=` to `<` left all tests green in both languages, and because
+`parity.sh` only checks that the two languages *agree*, flipping it in both would have sailed
+through the whole gate. This is precisely the reasoning that produced the volatile suite's
+golden-answer phase, not applied to this new stateful algorithm.
+
+**[MEDIUM] I published byte counts I had stopped measuring.** This section originally claimed
+`3042 → 3507`; the real numbers for the fixture as committed are `3289 → 3845`. The counts
+were measured correctly — and then the fixture was rebuilt to add CJK paths, and the old
+numbers were carried forward without re-measuring. This is the "borrowed measurement" lesson
+in a nastier form than the one already recorded in this repo: the number was not borrowed from
+someone else, it was borrowed **from my own earlier run**, and being the person who measured
+it the first time supplies a confidence that no longer applies once the input changes.
+
+Known limitations, all degrading to truncate or to conservative retention, never to wrong
+output — and note that this list is about the SEARCH strategy as a whole, not only what M24
+introduced:
+
+- A context line whose **content** contains `:digits:` (a timestamp literal in source, say) is
+  taken for a match line. It is then kept rather than following its owner — conservative, no
+  data lost. This is the price paid for retiring the CRITICAL above; when the two cannot both
+  be had, the smaller harm wins.
+- Windows backslash paths (`C:\Users\me\foo.py:42:hit`) are never claimed — the `/` check
+  requires a forward slash. True since M14, not introduced by M24.
+- `rg --heading` and `--no-filename` output (`42:content`, with the filename on its own line)
+  is never claimed, for either match or context lines. Also true since M14.
+- A filename shaped like `a-1-b.py` is now handled correctly for match lines and, via the
+  allowlist, for its context lines too — this limitation is **retired**.
+
+Still open, logged rather than fixed: `parity.sh`'s phase 3 (adversarial cases with golden
+answers, built precisely because "both sides agree" is not "both sides are right") covers only
+the volatile module. The SEARCH attribution algorithm is now comparably stateful and deserves
+the same treatment.
 
 ## Notes — M24（2026-08-11）
 
@@ -917,18 +993,73 @@ M14 退步了：`./my dir/foo.py:42:hit`（macOS 上很常見）從認領變成�
   立的：17 個既有 fixture 的 pipeline 輸出各取 sha256，改動 stash 掉一次、套用再一次 ——
   逐字節相同。
 - 新的 `18_rg_context.json` 驗過它真的在測新路徑：M24 前落 TRUNCATE、後走 SEARCH。存活檔數
-  **2/4 → 4/4**，而輸出反而從 3042 *漲到* 3507 bytes —— 這是刻意用壓縮率換掉這支策略存在的
-  理由（命中分布在哪些檔），與 M22 同一種取捨。
+  **2/4 → 4/4**，而輸出反而從 **3289 漲到 3845 bytes** —— 這是刻意用壓縮率換掉這支策略存在的
+  理由（命中分布在哪些檔），與 M22 同一種取捨。*（本節初版的位元數是錯的，見下方 review 回合。）*
 - fixture 刻意混入中文路徑（`./源碼/引擎/派發.py`），因為模組註解宣稱「Python char index /
   Rust byte index 這一對在非 ASCII 輸入上仍逐字節一致」（M20 的 native-index 範式）——
   **這個宣稱先前沒有任何 gate 守著。**
 - 空白防線雙向驗過：拿掉它，「內嵌路徑的 log 行」那條測試會 FAIL；而它的存在不影響 `:` 型路徑。
 
-兩則已知限制，都是落回 truncate 兜底、不會產出錯輸出：檔名形如 `a-1-b.py` 會讓最早標記落在
-檔名內（工業版也有同樣特性）；含空白路徑的 rg **context** 行不認領，但該檔的 match 行仍認領。
-
-閘門：Python 204 → **214**、Rust 195 → **201**、parity **18** fixtures × 兩相 + 15 個
+閘門：Python 204 → **221**、Rust 195 → **206**、parity **18** fixtures × 兩相 + 15 個
 adversarial 案例 + id_field 形狀斷言、clippy 0。
+
+### review 回合：三支 reviewer、七條指控，七條全部成立
+
+M24 push 之後由三支 reviewer（Python、Rust、綜合）稽核。**每條指控都先獨立複驗才接受，
+而七條全部是真的。** 其中最重要的一條是：這個里程碑的初版**把它自己要修的病重演了一遍**。
+
+**[CRITICAL]「取最早標記」讓閘門再一次自己關掉。** 檔名形如 `step-2-runner.py` 會在真標記
+`:42:` 左邊放一個合法標記 `-2-`，於是 path 被切成 `./src/step`。本節初版把它輕描淡寫成
+「罕見檔名的已知限制，落 truncate 兜底、不會產出錯輸出」—— **這句話兩半都是錯的**。這種檔名
+一點都不罕見（migration、`step-N-`、`part-N-of-M`、版本號），而且傷害不侷限於那一行：命中行
+認不得 → 可丟數歸零 → 比率閘門不認領整段 → **結果裡每一個檔案**都失去它的命中分布，正是
+M24 存在的理由被整個抹掉。
+
+修法把「猜哪個標記才是真的」換成**兩趟掃描 + 檔名白名單**：趟一認命中行（`:` 型歧義小得多）
+並收集 file_key，趟二只接受 path 落在這些 key 裡的 `-` 型候選。於是 `-2-`（→`./src/step`）
+出局、`-41-`（→`./src/step-2-runner.py`）中選 —— 問題不再是「哪個候選看起來對」，而是
+「這個 path 是某個命中行認過的檔案嗎」。
+
+這條白名單同時**讓空白黑名單退場**。同一個里程碑稍早加的防線（「`-` 型的 path 不得含空白」）
+被 U+3000 全形空白直接走過去 —— 而這個里程碑的主打功能正是 CJK 路徑支援。教訓不是
+「再多列舉幾個空白字元」（那是開放集合），而是**用白名單取代列舉**，也就是趟二在做的事。
+
+**[HIGH] 第一個候選失敗就放棄。** `2026-06-20 ./src/foo.py:42:hit` 整行認不得 —— `-06-`
+候選沒過 `/` 檢查，掃描就 return 了，右邊真正的 `:42:` 從沒被看到。M14 認得這種行，M24
+把它弄退步了。現在掃描收集所有候選，不會停在第一個。
+
+**[HIGH] context 歸屬追的是「全域最近命中」而非「同檔最近命中」** —— 儘管 docstring 宣稱的是
+後者。別的檔案的命中卡在 context 行與其真正 owner 之間，就把 owner 遮掉了，歸屬落到
+「找不到 owner → 保留」，留下的正是不變量明文禁止的孤兒 context。單次 `rg -C` 的輸出同檔
+連續、永遠踩不到；但 headroom 壓的是 agent 組裝出來的 tool_result，多次搜尋貼在一起是常態
+—— 而兩語言的測試產生器結構上只吐得出「同檔連續」的輸入。前向/後向表已改為 per-key。
+
+**[HIGH] 平手規則根本沒有測試。**「平手取前者」在三處被當成刻意決策寫著，卻沒有任何 fixture
+產生過兩個等距的命中：把 `<=` 翻成 `<`，兩語言測試全綠；而因為 `parity.sh` 只檢查兩語言
+**一致**，兩邊同時翻轉會直接通過整條閘門。這正是當初催生 volatile 那一相 golden 答案的同一套
+推理，只是沒有被套用到這個新的有狀態演算法上。
+
+**[MEDIUM] 我發布了自己已經停止量測的數字。** 本節初版寫 `3042 → 3507`，而 fixture 實際
+committed 的版本是 `3289 → 3845`。數字當初量得沒錯 —— 然後 fixture 被重建加入 CJK 路徑，
+舊數字卻直接沿用、沒有重量。這是這個 repo 已經記過的「借來的量測」的更難纏版本：數字不是借
+別人的，是**借自己前一次跑的**，而「第一次是我自己量的」會給出一種輸入改變後早已不適用的信心。
+
+已知限制（全部退化成 truncate 或保守保留，絕不產出錯輸出）—— 注意這份清單講的是 SEARCH
+策略整體，不只是 M24 帶進來的部分：
+
+- context 行的**內容**若含 `:數字:`（例如原始碼裡的時間戳字面值）會被當成命中行，於是被保留
+  而非跟隨 owner —— 保守、不丟資料。這是拿來換掉上面那條 CRITICAL 的代價；兩者不可兼得時，
+  選傷害小的。
+- Windows 反斜線路徑（`C:\Users\me\foo.py:42:hit`）永不認領 —— `/` 檢查要求正斜線。自 M14
+  起如此，非 M24 引入。
+- `rg --heading` 與 `--no-filename` 的輸出（`42:content`，檔名自己一行）永不認領，match 與
+  context 行皆然。同樣自 M14 起如此。
+- 檔名形如 `a-1-b.py` 現在命中行判讀正確，其 context 行也透過白名單正確歸屬 —— 這條限制
+  **已解除**。
+
+仍未處理、記錄而非修掉：`parity.sh` 的第三相（帶 golden 答案的 adversarial 案例，當初就是
+因為「兩邊一致」不等於「兩邊都對」才建的）目前只覆蓋 volatile 模組。SEARCH 的歸屬演算法現在
+同樣是有狀態的，值得比照辦理。
 
 ## Run / 執行
 
