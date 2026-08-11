@@ -673,6 +673,46 @@ every output for the planted secret. Gates: Python 169 → 200, Rust 164 → 191
 fixtures × 2 phases + 15 adversarial cases, clippy 0. End-to-end: posting the fixture through
 the running proxy emits four observation lines and forwards bytes unchanged.
 
+### review 第二輪：三條 HIGH，都是「修了一半就收手」
+
+再跑一次兩支 reviewer。rust-reviewer 仍 BLOCK，三條 HIGH 每一條我都獨立複驗成立。
+
+**`location` 是 C1 沒關掉的另一半。** sample 政策擋住了「命中欄位的值」，但
+`location` 是**客戶自己的 key 名串起來的路徑**，而祖先 key 完全不受 needle 約束 ——
+`{"cust-4021@example.com":{"Bearer sk-live-XYZ":{"trace_id":"v"}}}` 會把整串印進觀測線。
+而且沒有長度上限：200 KB 的 key 名就是 200 KB 的單行 stderr（實測 200031 字元）。
+**我用來否決舊 sample 政策的理由，原封不動適用於這裡，但我沒有把它套過去。**
+處置是設界而非消除（location 是這筆 finding 唯一可行動的內容）：單段 40 字元、
+總長 200 字元、超過則中段省略而保頭保尾。
+
+**`eprintln!` 那條修了等於沒修。** 我加固了自己新寫的 `emit_volatile_observations`，
+還在 commit message 裡寫「就在剛宣告絕不 panic 的那條路徑上」—— 但同一個 `forward()`
+函式往下 25 行的 `proxy.rs:191` 仍是 `eprintln!`，而**它每個請求都跑**（含 GET），
+觸發面比我修的那條更廣。端到端行為一個 byte 都沒變，只是把 panic 往後挪了幾行。
+這是「會跑不等於有作用」的教科書版本：我驗證了新函式，沒驗證那個宣稱的目標。
+現在 `forward()` 與 SSE 路徑都改用 `writeln!`，並實測 stderr reader 退場後連送 7 次
+請求 proxy 仍存活。
+
+**「屬效能而非正確性」的判斷被數據推翻。** 每個節點無條件 `format!` 一條 location，
+即使整份 body 零 findings：1 MiB 的深結構 body 要 114 ms / 166 MB，同位元組數的淺
+結構只要 1.6 ms / 4.3 MB。`MAX_SCAN_BYTES` 限的是**位元組**不是**衍生工作量**，這個
+洞正好從它底下鑽過去，而這條路徑跑在轉發之前、完全由 client 控制。改成可變的片段
+堆疊（push/pop），location 只在真的產生 finding 時才具體化。
+
+同輪一併修掉的還有：`truncated` 一號多用（「撞上限」與「body 太大沒掃」共用一個
+旗標，於是 proxy 會對沒掃過的 body 印出「已達 10 個相異位置的上限」—— 修掉第一層
+歧義又長出第二層）拆成兩個訊號；`detect_volatile_content` 這個公開 API 在收手工建的
+深 `Value` 時會 stack overflow **abort**（比 panic 更糟，連攔都攔不到）→ 走訪內加深度
+守門，並誠實記下界線：守門讓走訪有界，但救不了 serde_json 自己的遞迴 `Drop`
+（5000 層時它自己就 abort）。
+
+**adversarial gate 自己也被打穿了。** 祕密外洩那道守門只斷言「輸出不含 SECRET」——
+把 fixture 裡的祕密換成同長度但不含 needle 的值，grep 的 needle 從此不在輸入裡、
+永遠不可能命中，整條 gate 全綠。**這正是我自己在 gate 註解裡寫的那個形狀，卻在同一份
+檔案裡犯了一次。** 現在先正向斷言「祕密確實在 fixture 輸入裡」再斷言它不在輸出裡，
+另加「非空 golden 數」的斷言（15 個 golden 有 6 個本來就是空的）。
+閘門：Python 200 → 204、Rust 191 → 195、parity 三相全過、clippy 0。
+
 ## Notes — M23（2026-08-10）
 
 M23 是重建**第一個觀測器**：一個 byte 都不改。在它之前的所有東西 —— 包含 M3 的
