@@ -809,6 +809,127 @@ adversarial fixture，而且每個都有 **golden** 而非只比對兩語言是�
 parity 17 fixtures × 兩相 + 15 個 adversarial 案例、clippy 0。端到端：把 fixture POST
 進跑著的 proxy，印出四行觀測線且轉發的 bytes 不變。
 
+## Notes — M24 (2026-08-11)
+
+M24 is the third fix that came out of **reading the answer key** (after M21 and M22), and
+all three share a root cause: **a criterion written for one shape of input degrades silently
+when it meets the same genre in a different shape.** Here the shape is `rg -C`.
+
+The `SEARCH` strategy recognised only `file:lineno:content`. ripgrep's context lines use `-`
+as the separator (`./src/main.py-40-content`), which the classifier did not recognise. That
+is worse than "context lines go uncompressed": unrecognised lines inflate the **denominator**
+of a ratio gate (`droppable / total >= 0.3`), so the strategy switches itself off. Measured
+here, not quoted: with 10 files × 8 matches the droppable count stays at 50 while the
+denominator grows, so the ratio goes 0.625 (plain grep, claimed) → 0.208 at `-C 1` → 0.125 at
+`-C 2` → 0.069 at `-C 4`, all falling through to blind head/tail truncation. **The general
+principle: a ratio gate whose denominator includes items the classifier cannot parse will
+switch itself off as the unparsed fraction grows.**
+
+The fix is the answer key's: **anchor on the line-number marker `<sep>\d+<sep>` (sep ∈ `:`
+`-`), not on the path's character set** — anchor on the constrained field, not the free-form
+one. Everything before the earliest marker is the path, everything after is content, and the
+leading separator decides the line's identity. This also fixes filenames containing `-` for
+free. After the fix the ratio is 0.625 at **every** context width, because context lines enter
+the numerator and denominator together.
+
+Two things surfaced during implementation that the reading note had not anticipated, and both
+are more interesting than the fix itself:
+
+**1. Following the note literally would let context lines crowd out the matches.** If context
+lines count as independent matches, then under `-C 1` each file's `KEEP_PER_FILE = 3` budget
+is spent on context/match/context — one real hit survives instead of three. Context is an
+*attachment* to a hit, not a hit. So context lines follow the **nearest same-file match**
+(ties to the earlier one), which under rg's layout assigns `after` lines to the preceding hit
+and `before` lines to the following one: kept hits keep their context, dropped hits take their
+context with them, and no orphan context is left behind.
+
+**2. The re-anchoring introduced a new false-positive surface, and the obvious guard against
+it caused a regression.** Since the prefix is now "everything before the marker", a log line
+embedding a path — `/usr/src/app.py 2026-06-20 boom` — gets anchored at `-06-` and its prefix
+does contain `/`. The obvious guard is "the path must not contain whitespace". But applying it
+to *both* separator types silently regressed M14: `./my dir/foo.py:42:hit` (common on macOS)
+went from claimed to unclaimed — **a fix for "the guard switches itself off" that introduced
+another instance of the same bug.** The whitespace guard therefore applies **only to `-`-type
+markers**, which is where the new threat actually lives; `:`-type plus the `/` check was
+already proven sufficient by M14. *Put the guard on the surface you just added, not on the
+path that was already safe.*
+
+Verification worth recording, because passing gates is not the same as gating:
+
+- `parity.sh` proves the two languages **agree**, not that the output **didn't change** — both
+  sides can change in agreement. Zero regression was established separately: sha256 of all 17
+  pre-existing fixtures' pipeline output, captured with the change stashed and again with it
+  applied — byte-identical.
+- The new `18_rg_context.json` was checked to genuinely exercise the new path: before M24 it
+  falls to TRUNCATE, after it routes to SEARCH. Surviving files go **2/4 → 4/4** while the
+  output *grows* 3042 → 3507 bytes — a deliberate trade of compression ratio for the signal
+  the strategy exists to preserve (which files the hits are in), the same trade M22 made.
+- The fixture deliberately mixes ASCII and CJK paths (`./源碼/引擎/派發.py`), because the
+  module comments claim the Python-char-index / Rust-byte-index pair stays byte-identical on
+  non-ASCII input (the M20 native-index pattern) — **that claim previously had no gate.**
+- The whitespace guard was verified in both directions: removing it makes the
+  log-line-with-a-path test fail, and its presence does not affect the `:`-type path.
+
+Known limitations, both falling back to truncate rather than producing wrong output: a
+filename shaped like `a-1-b.py` puts the earliest marker inside the filename (the industrial
+version shares this property); and rg **context** lines under a path containing whitespace are
+not claimed, though that file's match lines still are.
+
+Gates: Python 204 → **214**, Rust 195 → **201**, parity **18** fixtures × two phases + 15
+adversarial cases + the id_field shape assertion, clippy 0.
+
+## Notes — M24（2026-08-11）
+
+M24 是第三個**從讀解答本得出**的修補（前兩個是 M21、M22），三者的病根同一個：
+**判準是為某一種輸入形狀寫的，遇到同類但形狀不同的輸入就安靜地退化。** 這次的形狀是 `rg -C`。
+
+`SEARCH` 策略只認 `file:lineno:content`。ripgrep 的 context 行用 `-` 分隔
+（`./src/main.py-40-content`），分類器不認得。這比「context 行沒被壓」嚴重得多：未認出的行
+會灌大比率閘門的**分母**（可丟/總行 >= 0.3），於是策略自己關掉。實測（自己重跑、非引用）：
+10 檔 × 8 命中下可丟數維持 50 而分母變大，佔比從 0.625（純 grep，認領）→ `-C 1` 的 0.208
+→ `-C 2` 的 0.125 → `-C 4` 的 0.069，全部落到盲目頭尾截斷。**通則：比率型閘門的分母若含
+分類器看不懂的東西，未知比例一升，閘門就自己關掉。**
+
+修法照解答本：**錨在行號標記 `<sep>\d+<sep>`（sep ∈ `:` `-`），不錨在路徑的字元集** ——
+錨在受限欄位，不錨在自由欄位。最早標記之前是路徑、之後是內容，開頭的分隔符決定這行的身分。
+順帶把「檔名含 `-`」也修好了。修完之後，**任何** context 寬度下佔比都是 0.625，因為 context
+行是連同分子與分母一起進來的。
+
+實作時浮現兩件精讀筆記沒預料到的事，兩件都比修補本身更有意思：
+
+**1. 照字面做會讓 context 行把命中擠掉。** 若 context 行算獨立命中，`-C 1` 下每檔
+`KEEP_PER_FILE = 3` 的額度會被 context/match/context 吃掉 —— 真命中只活 1 筆而非 3 筆。
+context 是命中的**附屬**，不是命中。所以 context 行跟隨**最近的同檔命中**（平手取前者），
+在 rg 的排版下正好把 `after` 歸前一個命中、`before` 歸後一個命中：保留的命中連同 context
+一起保、丟掉的一起丟，不留孤兒 context。
+
+**2. 重新錨定引進了新的誤判面，而擋它的直覺作法造成了回歸。** prefix 現在是「標記前的一切」，
+於是內嵌路徑的 log 行 —— `/usr/src/app.py 2026-06-20 boom` —— 會被 `-06-` 錨中，而它的
+prefix 確實含 `/`。直覺的防線是「路徑不得含空白」。但把它套到**兩種**分隔符上，就安靜地讓
+M14 退步了：`./my dir/foo.py:42:hit`（macOS 上很常見）從認領變成不認領 —— **一個為了修
+「閘門自己關掉」而引進另一個同病的修補。** 所以空白防線**只套 `-` 型標記**，也就是新威脅真正
+所在之處；`:` 型加上 `/` 檢查在 M14 已被證明足夠。*防線要加在你剛剛新增的那個面上，
+不是加在原本就安全的路徑上。*
+
+值得記錄的驗證，因為「閘門通過」不等於「閘門守到」：
+
+- `parity.sh` 證明的是兩語言**一致**，不是輸出**沒變** —— 兩邊可以一致地變。零回歸是另外
+  立的：17 個既有 fixture 的 pipeline 輸出各取 sha256，改動 stash 掉一次、套用再一次 ——
+  逐字節相同。
+- 新的 `18_rg_context.json` 驗過它真的在測新路徑：M24 前落 TRUNCATE、後走 SEARCH。存活檔數
+  **2/4 → 4/4**，而輸出反而從 3042 *漲到* 3507 bytes —— 這是刻意用壓縮率換掉這支策略存在的
+  理由（命中分布在哪些檔），與 M22 同一種取捨。
+- fixture 刻意混入中文路徑（`./源碼/引擎/派發.py`），因為模組註解宣稱「Python char index /
+  Rust byte index 這一對在非 ASCII 輸入上仍逐字節一致」（M20 的 native-index 範式）——
+  **這個宣稱先前沒有任何 gate 守著。**
+- 空白防線雙向驗過：拿掉它，「內嵌路徑的 log 行」那條測試會 FAIL；而它的存在不影響 `:` 型路徑。
+
+兩則已知限制，都是落回 truncate 兜底、不會產出錯輸出：檔名形如 `a-1-b.py` 會讓最早標記落在
+檔名內（工業版也有同樣特性）；含空白路徑的 rg **context** 行不認領，但該檔的 match 行仍認領。
+
+閘門：Python 204 → **214**、Rust 195 → **201**、parity **18** fixtures × 兩相 + 15 個
+adversarial 案例 + id_field 形狀斷言、clippy 0。
+
 ## Run / 執行
 
 ```bash
