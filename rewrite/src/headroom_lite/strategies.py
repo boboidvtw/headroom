@@ -290,43 +290,115 @@ MIN_SEARCH_LINES = 6  # 太少行不值得當 search 處理
 SEARCH_DROP_RATIO = 0.3  # 可丟（超出每檔上限）行佔比下限 —— 低於此交給 truncate
 KEEP_PER_FILE = 3  # 每檔保留的代表性命中筆數
 
+# 行的身分（M24）：命中行 / 其附屬 context 行 / 都不是。空字串讓 truthiness 天然
+# 對應「不認領」，與 Rust 的 Option<(LineKind, &str)> 對稱。
+LINE_MATCH = "match"
+LINE_CONTEXT = "context"
+LINE_OTHER = ""
+
 
 def _match_line_key(line: str):
-    """grep/rg match 行判斷：回 (是否 match, file_key)。
+    """grep/rg 行判斷：回 (kind, file_key)，kind ∈ LINE_MATCH/LINE_CONTEXT/LINE_OTHER。
 
-    形如 `file:lineno:content`，且 file_key 必須含 `/`（排除 log 時間戳誤判）、
-    lineno 必須非空且全 ASCII 數字。非 match 行回 (False, "")。
+    M24：**錨在行號標記 `<sep>\\d+<sep>`（sep ∈ `:` `-`），不錨在路徑**。取行內最早的
+    標記，其前為路徑、其後為內容；開頭的 sep 決定身分（`:` 命中、`-` 是 rg -C 的 context）。
+    這樣檔名含 `-` 不再破壞判讀，`rg -C` 的 context 行也終於被認得。
+
+    三道防線（缺一就誤判，都測過）：
+      1. 路徑非空 —— 行首即標記（`:42:x`）不算。
+      2. 路徑須含 `/` —— 擋 log 時間戳。M24 後這條更吃重：`2026-06-20` 的 `-06-` 本身就是
+         一個合法的行號標記，全靠 `/` 把它擋在門外。
+      3. **`-` 型標記**的路徑不得含空白 —— 錨定改動自帶的新誤判面：prefix 現在是「標記前
+         的一切」，於是 `/usr/src/app.py 2026-06-20 boom` 這類內嵌路徑的 log 行會被 `-06-`
+         錨中且含 `/`。
+
+    第 3 條為何只套 `-` 型：時間戳的威脅**完全來自「允許 `-` 當 sep」這個新增面**；
+    `:` 型 + `/` 檢查已由 M14 驗證足夠（`10:30:45` 的 path `10` 無 `/`）。若把空白檢查也
+    套到 `:` 型，`./my dir/foo.py:42:hit`（macOS 上很常見）會從 M14 的「認領」退化成
+    「不認領」—— 等於為了修「策略自己關掉」而引進另一個「策略自己關掉」。**防線要加在
+    新增的威脅面上，不是加在原本就安全的路徑上。**
+
+    已知限制兩則（都是落回 truncate 兜底、不會產出錯輸出）：
+      - 檔名本身形如 `a-1-b.py` 會讓最早標記落在檔名內而誤判成 context（工業版取最早
+        標記也有同樣特性，這種檔名罕見）。
+      - 含空白路徑的 rg **context** 行（`./my dir/a.py-42-ctx`）被第 3 條擋下 → 不認領、
+        一律保留；該檔的 match 行仍正常認領，只是壓縮率略低。
     """
-    i1 = line.find(":")
-    if i1 <= 0:  # 無冒號，或 file_key 為空（行首即冒號）
-        return False, ""
-    file_key = line[:i1]
-    if "/" not in file_key:  # 必須像路徑 —— 擋掉 `10:30:45` 這類時間戳
-        return False, ""
-    i2 = line.find(":", i1 + 1)
-    if i2 == -1:
-        return False, ""
-    lineno = line[i1 + 1 : i2]
-    # 刻意只認 ASCII 數字（與 Rust `is_ascii_digit` 逐字節對齊；不用 str.isdigit 認 unicode）
-    if not lineno or not all(0x30 <= ord(c) <= 0x39 for c in lineno):
-        return False, ""
-    return True, file_key
+    n = len(line)
+    i = 0
+    while i < n:
+        c = line[i]
+        if c == ":" or c == "-":
+            j = i + 1
+            # 刻意只認 ASCII 數字（與 Rust `is_ascii_digit` 逐字節對齊；不用 str.isdigit）
+            while j < n and 0x30 <= ord(line[j]) <= 0x39:
+                j += 1
+            if j > i + 1 and j < n and (line[j] == ":" or line[j] == "-"):
+                path = line[:i]
+                if not path or "/" not in path:
+                    return LINE_OTHER, ""
+                if c == "-" and (" " in path or "\t" in path):
+                    return LINE_OTHER, ""
+                return (LINE_MATCH if c == ":" else LINE_CONTEXT), path
+        i += 1
+    return LINE_OTHER, ""
 
 
 def _search_drop_flags(lines: list[str]) -> list[bool]:
-    """保序逐行掃：每個 file_key 計數，超過 KEEP_PER_FILE 的 match 行標記為「丟」。
+    """保序逐行掃：每個 file_key 計數，超過 KEEP_PER_FILE 的**命中**標記為「丟」。
 
-    只用 dict 做計數查找、從不迭代 dict —— 結果僅依輸入順序，無雜湊順序依賴（parity）。
+    M24 的歸屬規則：context 行不是獨立命中（否則 `rg -C 1` 下每檔留的 3 行會是
+    context/match/context，真命中只剩 1 筆），而是**跟隨距離最近的同檔命中**、平手取前者。
+    rg 的排版下這正好把 `after` 歸前一個命中、`before` 歸後一個命中，於是保留的命中連同
+    context 一起保、丟掉的一起丟（不留孤兒 context）。
+
+    只用 dict 做計數查找、從不迭代 dict；歸屬用純索引數學（前向/後向各一趟）——
+    結果僅依輸入順序，無雜湊順序依賴（parity）。
     """
+    parsed = [_match_line_key(line) for line in lines]
+    n = len(lines)
+
+    # 命中行的去留：每個 file_key 計數，超過上限即丟。
     counts: dict[str, int] = {}
-    flags: list[bool] = []
-    for line in lines:
-        is_match, key = _match_line_key(line)
-        if not is_match:
-            flags.append(False)
+    flags: list[bool] = [False] * n
+    for i, (kind, key) in enumerate(parsed):
+        if kind == LINE_MATCH:
+            counts[key] = counts.get(key, 0) + 1
+            flags[i] = counts[key] > KEEP_PER_FILE
+
+    # 前向一趟：每個位置「最近的前一個命中」的 (index, key)。
+    prev_idx: list[int] = [-1] * n
+    prev_key: list[str] = [""] * n
+    last = -1
+    for i, (kind, key) in enumerate(parsed):
+        prev_idx[i], prev_key[i] = last, (parsed[last][1] if last >= 0 else "")
+        if kind == LINE_MATCH:
+            last = i
+
+    # 後向一趟：每個位置「最近的後一個命中」的 (index, key)。
+    next_idx: list[int] = [-1] * n
+    next_key: list[str] = [""] * n
+    last = -1
+    for i in range(n - 1, -1, -1):
+        next_idx[i], next_key[i] = last, (parsed[last][1] if last >= 0 else "")
+        if parsed[i][0] == LINE_MATCH:
+            last = i
+
+    # context 行歸屬：距離小者勝，平手取前者；無同檔命中則保留。
+    for i, (kind, key) in enumerate(parsed):
+        if kind != LINE_CONTEXT:
             continue
-        counts[key] = counts.get(key, 0) + 1
-        flags.append(counts[key] > KEEP_PER_FILE)
+        before_ok = prev_idx[i] >= 0 and prev_key[i] == key
+        after_ok = next_idx[i] >= 0 and next_key[i] == key
+        if before_ok and after_ok:
+            owner = prev_idx[i] if (i - prev_idx[i]) <= (next_idx[i] - i) else next_idx[i]
+        elif before_ok:
+            owner = prev_idx[i]
+        elif after_ok:
+            owner = next_idx[i]
+        else:
+            continue  # 找不到同檔命中 → 保留（保守）
+        flags[i] = flags[owner]
     return flags
 
 

@@ -324,41 +324,135 @@ const MIN_SEARCH_LINES: usize = 6;
 const SEARCH_DROP_RATIO: f64 = 0.3;
 const KEEP_PER_FILE: usize = 3;
 
-/// grep/rg match 行判斷：回 `Some(file_key)` 或 `None`。
-/// 形如 `file:lineno:content`，file_key 須含 `/`（排除時間戳）、lineno 須非空全 ASCII 數字。
-fn match_line_key(line: &str) -> Option<&str> {
-    let i1 = line.find(':')?;
-    if i1 == 0 {
-        return None; // file_key 為空（行首即冒號）
-    }
-    let file_key = &line[..i1];
-    if !file_key.contains('/') {
-        return None; // 必須像路徑 —— 擋掉 `10:30:45` 這類時間戳
-    }
-    let rest = &line[i1 + 1..];
-    let i2 = rest.find(':')?;
-    let lineno = &rest[..i2];
-    if lineno.is_empty() || !lineno.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(file_key)
+/// 行的身分（M24）：命中行 / 其附屬 context 行（rg -C 的 `-` 分隔行）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineKind {
+    Match,
+    Context,
 }
 
-/// 保序逐行掃：每個 file_key 計數，超過 KEEP_PER_FILE 的 match 行標記為「丟」。
-/// HashMap 只做查找/累加、從不迭代 —— 結果僅依輸入順序，無雜湊順序依賴（parity）。
-fn search_drop_flags(lines: &[&str]) -> Vec<bool> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    lines
-        .iter()
-        .map(|line| match match_line_key(line) {
-            Some(key) => {
-                let c = counts.entry(key).or_insert(0);
-                *c += 1;
-                *c > KEEP_PER_FILE
+/// grep/rg 行判斷：回 `Some((kind, file_key))` 或 `None`。
+///
+/// M24：**錨在行號標記 `<sep>\d+<sep>`（sep ∈ `:` `-`），不錨在路徑**。取行內最早的
+/// 標記，其前為路徑、其後為內容；開頭的 sep 決定身分（`:` 命中、`-` 是 rg -C 的 context）。
+/// 檔名含 `-` 不再破壞判讀，`rg -C` 的 context 行也終於被認得。
+///
+/// 三道防線（缺一就誤判，都測過）：
+///   1. 路徑非空 —— 行首即標記（`:42:x`）不算。
+///   2. 路徑須含 `/` —— 擋 log 時間戳。M24 後這條更吃重：`2026-06-20` 的 `-06-` 本身就是
+///      一個合法行號標記，全靠 `/` 把它擋在門外。
+///   3. **`-` 型標記**的路徑不得含空白 —— 錨定改動自帶的新誤判面：prefix 現在是「標記前
+///      的一切」，於是 `/usr/src/app.py 2026-06-20 boom` 會被 `-06-` 錨中且含 `/`。
+///
+/// 第 3 條為何只套 `-` 型：時間戳的威脅**完全來自「允許 `-` 當 sep」這個新增面**；
+/// `:` 型 + `/` 檢查已由 M14 驗證足夠。若把空白檢查也套到 `:` 型，
+/// `./my dir/foo.py:42:hit`（macOS 上很常見）會從 M14 的「認領」退化成「不認領」——
+/// 等於為了修「策略自己關掉」而引進另一個「策略自己關掉」。
+///
+/// 已知限制兩則（都是落回 truncate 兜底、不會產出錯輸出）：檔名形如 `a-1-b.py` 會讓最早
+/// 標記落在檔名內；含空白路徑的 rg **context** 行被第 3 條擋下（該檔 match 行仍認領）。
+///
+/// parity：全程 ASCII byte 比對；`i` 落在 ASCII sep 上必為 char 邊界，`&line[..i]` 安全。
+/// Python 用 char index、此處用 byte index，各自定位到同一個邏輯位置（M20 HTML 的
+/// native-index 範式）→ 非 ASCII 路徑也逐字節一致。
+fn match_line_key(line: &str) -> Option<(LineKind, &str)> {
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        if c == b':' || c == b'-' {
+            let mut j = i + 1;
+            while j < n && b[j].is_ascii_digit() {
+                j += 1;
             }
-            None => false,
-        })
-        .collect()
+            if j > i + 1 && j < n && (b[j] == b':' || b[j] == b'-') {
+                let path = &line[..i];
+                if path.is_empty() || !path.contains('/') {
+                    return None;
+                }
+                if c == b'-' && (path.contains(' ') || path.contains('\t')) {
+                    return None;
+                }
+                let kind = if c == b':' {
+                    LineKind::Match
+                } else {
+                    LineKind::Context
+                };
+                return Some((kind, path));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 保序逐行掃：每個 file_key 計數，超過 KEEP_PER_FILE 的**命中**標記為「丟」。
+///
+/// M24 的歸屬規則：context 行不是獨立命中（否則 `rg -C 1` 下每檔留的 3 行會是
+/// context/match/context，真命中只剩 1 筆），而是**跟隨距離最近的同檔命中**、平手取前者。
+/// rg 的排版下這正好把 `after` 歸前一個命中、`before` 歸後一個命中，於是保留的命中連同
+/// context 一起保、丟掉的一起丟（不留孤兒 context）。
+///
+/// HashMap 只做查找/累加、從不迭代；歸屬用純索引數學（前向/後向各一趟）——
+/// 結果僅依輸入順序，無雜湊順序依賴（parity）。
+fn search_drop_flags(lines: &[&str]) -> Vec<bool> {
+    let parsed: Vec<Option<(LineKind, &str)>> = lines.iter().map(|l| match_line_key(l)).collect();
+    let n = lines.len();
+
+    // 命中行的去留：每個 file_key 計數，超過上限即丟。
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut flags: Vec<bool> = vec![false; n];
+    for (i, p) in parsed.iter().enumerate() {
+        if let Some((LineKind::Match, key)) = p {
+            let c = counts.entry(key).or_insert(0);
+            *c += 1;
+            flags[i] = *c > KEEP_PER_FILE;
+        }
+    }
+
+    // 前向一趟：每個位置「最近的前一個命中」的 (index, key)。
+    let mut prev: Vec<Option<(usize, &str)>> = vec![None; n];
+    let mut last: Option<(usize, &str)> = None;
+    for (i, p) in parsed.iter().enumerate() {
+        prev[i] = last;
+        if let Some((LineKind::Match, key)) = p {
+            last = Some((i, key));
+        }
+    }
+
+    // 後向一趟：每個位置「最近的後一個命中」的 (index, key)。
+    let mut next: Vec<Option<(usize, &str)>> = vec![None; n];
+    let mut last: Option<(usize, &str)> = None;
+    for i in (0..n).rev() {
+        next[i] = last;
+        if let Some((LineKind::Match, key)) = &parsed[i] {
+            last = Some((i, key));
+        }
+    }
+
+    // context 行歸屬：距離小者勝，平手取前者；無同檔命中則保留。
+    for i in 0..n {
+        let Some((LineKind::Context, key)) = parsed[i] else {
+            continue;
+        };
+        let before = prev[i].filter(|(_, k)| *k == key);
+        let after = next[i].filter(|(_, k)| *k == key);
+        let owner = match (before, after) {
+            (Some((bi, _)), Some((ai, _))) => {
+                if i - bi <= ai - i {
+                    bi
+                } else {
+                    ai
+                }
+            }
+            (Some((bi, _)), None) => bi,
+            (None, Some((ai, _))) => ai,
+            (None, None) => continue, // 找不到同檔命中 → 保留（保守）
+        };
+        flags[i] = flags[owner];
+    }
+    flags
 }
 
 /// 嗅探：夠多行、且超出每檔上限的可丟命中佔比夠高才認領；否則讓後手兜底。

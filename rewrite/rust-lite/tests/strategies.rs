@@ -327,6 +327,107 @@ fn search_applies_on_grep_output() {
     assert!((SEARCH.applies)(&search_default()));
 }
 
+// ── M24：錨定行號標記，認得 rg -C 的 `-` 分隔 context 行（對齊 Python）──
+//
+// 病：`rg -C` 的 context 行用 `-` 分隔，不被舊判準認得 → 未認出的行灌大比率閘門的
+// 分母 → 策略在最該生效時自己關掉、落盲目截斷。實測 10 檔 8 命中：ctx=0 佔比 0.625
+// 認領，ctx=1 掉到 0.208、ctx=4 掉到 0.069，全部落截斷。
+
+/// `rg -C <ctx>` 風格輸出：命中行用 `:` 分隔、context 行用 `-` 分隔。
+fn rg_context(n_files: usize, per_file: usize, ctx: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for f in 0..n_files {
+        for m in 0..per_file {
+            let ln = (m + 1) * 10;
+            for c in (1..=ctx).rev() {
+                lines.push(format!("./src/module_{f}.py-{}-    before_{c}", ln - c));
+            }
+            lines.push(format!("./src/module_{f}.py:{ln}:    result = compute(value_{m})"));
+            for c in 1..=ctx {
+                lines.push(format!("./src/module_{f}.py-{}-    after_{c}", ln + c));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+#[test]
+fn search_applies_on_rg_context_output() {
+    // 病灶正面測：rg -C 1..4 全部都要認領（M24 之前全是 false）。
+    for ctx in 1..=4 {
+        assert!(
+            (SEARCH.applies)(&rg_context(3, 12, ctx)),
+            "rg -C {ctx} 未被認領"
+        );
+    }
+}
+
+#[test]
+fn search_context_lines_do_not_crowd_out_real_matches() {
+    // context 是命中的附屬，不該當獨立命中去佔 KEEP_PER_FILE 額度
+    // （否則每檔留的 3 行是 context/match/context，真命中只剩 1 筆）。
+    let out = (SEARCH.squeeze)(&rg_context(3, 12, 1)).expect("rg -C 輸出該壓");
+    for f in 0..3 {
+        assert_eq!(
+            out.matches(&format!("./src/module_{f}.py:")).count(),
+            3,
+            "每檔該保留 KEEP_PER_FILE 個真命中"
+        );
+    }
+}
+
+#[test]
+fn search_kept_matches_keep_their_context() {
+    // 保留的命中連同 context 一起保；被丟的命中其 context 一起丟（不留孤兒）。
+    let out = (SEARCH.squeeze)(&rg_context(1, 12, 1)).expect("rg -C 輸出該壓");
+    for m in 0..3 {
+        let ln = (m + 1) * 10;
+        assert!(out.contains(&format!("./src/module_0.py-{}-    before_1", ln - 1)));
+        assert!(out.contains(&format!("./src/module_0.py-{}-    after_1", ln + 1)));
+    }
+    for m in 3..12 {
+        let ln = (m + 1) * 10;
+        assert!(!out.contains(&format!("./src/module_0.py-{}-", ln - 1)));
+        assert!(!out.contains(&format!("./src/module_0.py-{}-", ln + 1)));
+    }
+}
+
+#[test]
+fn search_plain_grep_not_regressed() {
+    // 另一側：純 grep（無 context 行）必須維持認領，M14 行為不得回歸。
+    assert!((SEARCH.applies)(&search_default()));
+}
+
+#[test]
+fn search_claims_grep_output_under_a_path_with_spaces() {
+    // M24 回歸守門：M14 認領含空白的路徑（macOS 常見），M24 不得讓它退步。
+    // 空白防線只套 `-` 型標記（時間戳的威脅面），不套 `:` 型。
+    let text: String = (0..3)
+        .flat_map(|f| {
+            (0..12).map(move |ln| {
+                format!("./my dir/module_{f}.py:{}:    result = compute(value_{ln})", ln + 1)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        (SEARCH.applies)(&text),
+        "含空白路徑的 grep 輸出仍須被 search 認領"
+    );
+}
+
+#[test]
+fn search_rejects_log_line_containing_a_path() {
+    // M24 自帶的新誤判面：錨定後 prefix 是「標記前的一切」，於是含路徑的 log 行會被
+    // `-06-` 錨中且含 `/`。防線＝path 段不得含空白。用「整段是否被 search 認領」驗證
+    // （match_line_key 是私有函式，測公開行為）。
+    let log: String = (0..40)
+        .map(|i| format!("/usr/src/app.py 2026-06-20 event {i} happened"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!(SEARCH.applies)(&log), "含路徑的 log 行不得被 search 認領");
+}
+
 #[test]
 fn search_applies_false_on_prose() {
     let prose = (0..30)

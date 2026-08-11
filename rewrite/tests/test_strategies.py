@@ -296,15 +296,18 @@ def _search(n_files: int = 3, per_file: int = 12) -> str:
 
 
 def test_search_match_line_requires_slash_in_path():
-    # 真 grep 行（含路徑）→ match。
-    ok, key = _match_line_key("./src/foo.py:42:hit")
-    assert ok is True and key == "./src/foo.py"
+    # 真 grep 行（含路徑）→ match。（M24 起回傳 kind 而非 bool，語意不變。）
+    kind, key = _match_line_key("./src/foo.py:42:hit")
+    assert kind == "match" and key == "./src/foo.py"
 
 
 def test_search_match_line_rejects_timestamp():
     # ⚠️ 地雷防線：log 時間戳 `10:30:45` 不含 `/` → 不可被當成 match line。
-    assert _match_line_key("2026-06-20T10:30:45 ERROR boom")[0] is False
-    assert _match_line_key("10:30:45 something")[0] is False
+    # M24 加測 `-` 分隔形式：錨定改成 `<sep>\d+<sep>` 後，`2026-06-20` 的 `-06-` 也會錨中，
+    # 全靠 `/` 檢查擋住 —— 這條防線在 M24 之後比之前更吃重。
+    assert _match_line_key("2026-06-20T10:30:45 ERROR boom")[0] == ""
+    assert _match_line_key("10:30:45 something")[0] == ""
+    assert _match_line_key("2026-06-20 10:30:45 boom")[0] == ""
 
 
 def test_search_applies_on_grep_output():
@@ -369,6 +372,105 @@ def test_search_does_not_swallow_logs():
 def test_search_registered_after_diff_before_log():
     names = [s.name for s in STRATEGIES]
     assert names.index("diff") < names.index("search") < names.index("log") < names.index("truncate")
+
+
+# ── M24：錨定行號標記，認得 rg -C 的 `-` 分隔 context 行（與 Rust tests/strategies.rs 對稱）──
+#
+# READING-04 實測的病：`rg -C` 任意行數 → context 行用 `-` 分隔不被 `_match_line_key()` 認得
+# → 未認出的行灌大比率閘門的分母（可丟/總行 >= 0.3）→ 佔比 0.625→0.208 → 策略自己關掉、
+# 落盲目截斷。修法照工業版：錨在**行號標記** `<sep>\d+<sep>`（sep ∈ `:` `-`），而非擴充
+# 路徑字元集 —— 錨在受限欄位不錨在自由欄位。
+from headroom_lite.strategies import LINE_CONTEXT, LINE_MATCH, LINE_OTHER
+
+
+def _rg_context(n_files: int = 3, per_file: int = 12, ctx: int = 1) -> str:
+    """`rg -C <ctx>` 風格輸出：命中行用 `:` 分隔、context 行用 `-` 分隔。"""
+    lines: list[str] = []
+    for f in range(n_files):
+        for m in range(per_file):
+            ln = (m + 1) * 10
+            for c in range(ctx, 0, -1):
+                lines.append(f"./src/module_{f}.py-{ln - c}-    before_{c}")
+            lines.append(f"./src/module_{f}.py:{ln}:    result = compute(value_{m})")
+            for c in range(1, ctx + 1):
+                lines.append(f"./src/module_{f}.py-{ln + c}-    after_{c}")
+    return "\n".join(lines)
+
+
+def test_search_match_line_recognises_rg_context_dash():
+    # M24 核心：`-` 分隔的 context 行必須被認得，且身分是 context 而非 match。
+    kind, key = _match_line_key("./src/main.py-40-    context here")
+    assert kind == LINE_CONTEXT and key == "./src/main.py"
+
+
+def test_search_match_line_kind_is_match_for_colon():
+    kind, key = _match_line_key("./src/foo.py:42:hit")
+    assert kind == LINE_MATCH and key == "./src/foo.py"
+
+
+def test_search_match_line_rejects_log_line_containing_a_path():
+    # M24 自帶的新誤判面：改錨定後 prefix 是「行號標記前的一切」，於是含路徑的 log 行
+    # 會被 `-06-` 錨中且 prefix 含 `/`。防線＝path 段不得含空白（真路徑不會有）。
+    assert _match_line_key("/usr/src/app.py 2026-06-20 boom")[0] == LINE_OTHER
+    assert _match_line_key("ERROR /var/log/a.log 2026-06-20 x")[0] == LINE_OTHER
+
+
+def test_search_applies_on_rg_context_output():
+    # 病灶正面測：rg -C 1..4 全部都要認領（M24 之前全是 False → 落截斷）。
+    for ctx in (1, 2, 3, 4):
+        assert SEARCH.applies(_rg_context(ctx=ctx)) is True, f"rg -C {ctx} 未被認領"
+
+
+def test_search_context_lines_do_not_crowd_out_real_matches():
+    # 若 context 行去佔 KEEP_PER_FILE 額度，每檔留下的 3 行會是 context/match/context，
+    # 真命中只剩 1 筆。context 是命中的附屬，不該當獨立命中計數。
+    from headroom_lite.strategies import KEEP_PER_FILE
+    out = _search_squeeze(_rg_context(n_files=3, per_file=12, ctx=1))
+    for f in range(3):
+        assert out.count(f"./src/module_{f}.py:") == KEEP_PER_FILE
+
+
+def test_search_kept_matches_keep_their_context():
+    # 保留的命中要連同 context 一起保（可定位）；被丟的命中其 context 一起丟（否則留下孤兒）。
+    out = _search_squeeze(_rg_context(n_files=1, per_file=12, ctx=1))
+    for m in range(3):  # 前 3 筆命中保留 → 其 before/after 都在
+        ln = (m + 1) * 10
+        assert f"./src/module_0.py-{ln - 1}-    before_1" in out
+        assert f"./src/module_0.py-{ln + 1}-    after_1" in out
+    for m in range(3, 12):  # 其餘命中被丟 → context 不得留成孤兒
+        ln = (m + 1) * 10
+        assert f"./src/module_0.py-{ln - 1}-" not in out
+        assert f"./src/module_0.py-{ln + 1}-" not in out
+
+
+def test_search_plain_grep_not_regressed():
+    # 另一側：純 grep（無 context 行）必須維持認領，M14 行為不得回歸。
+    assert SEARCH.applies(_search()) is True
+
+
+def test_search_rg_separator_line_is_not_claimed():
+    # rg 用 `--` 分隔不連續的 hunk：無行號標記 → 不認領 → 保留（非 match 行一律留）。
+    assert _match_line_key("--")[0] == LINE_OTHER
+
+
+def test_search_match_line_accepts_path_with_spaces():
+    # M24 回歸守門：M14 認領含空白的路徑（macOS 上很常見），M24 不得讓它退步。
+    # 空白防線只該套在 `-` 型標記（時間戳的威脅面）——`:` 型 + `/` 檢查已由 M14 驗證
+    # 足夠，把空白檢查也套上去，等於為了修「策略自己關掉」而引進另一個「策略自己關掉」。
+    kind, key = _match_line_key("./my dir/foo.py:42:hit")
+    assert kind == LINE_MATCH and key == "./my dir/foo.py"
+    kind, key = _match_line_key("./My Documents/src/a.py:7:x")
+    assert kind == LINE_MATCH and key == "./My Documents/src/a.py"
+
+
+def test_search_claims_grep_output_under_a_path_with_spaces():
+    # 端到端：含空白路徑的 grep 輸出整段仍要被 search 認領（而非落盲目截斷）。
+    text = "\n".join(
+        f"./my dir/module_{f}.py:{ln + 1}:    result = compute(value_{ln})"
+        for f in range(3)
+        for ln in range(12)
+    )
+    assert SEARCH.applies(text) is True
 
 
 # ── M15：json 內容感知策略（與 Rust tests/strategies.rs 對稱）──
